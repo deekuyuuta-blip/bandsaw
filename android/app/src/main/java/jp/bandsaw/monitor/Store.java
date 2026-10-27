@@ -79,9 +79,11 @@ public final class Store {
 
     // ---------------- PLC（SLMP）
     public static final class Plc {
-        public boolean on = false, udp = false;
+        public boolean on = false, udp = true;
+        /** true: PLC が読みに来る（シンプルCPU通信, アプリは SLMP サーバー）／ false: アプリから PLC に書き込む */
+        public boolean server = true;
         public String host = "192.168.3.39", dev = "D";
-        public int port = 5000, head = 1000;
+        public int port = 5000, head = 0;
 
         /** 画面表示用の先頭デバイス名（W は16進表記） */
         public String headName() {
@@ -92,7 +94,8 @@ public final class Store {
     public Plc loadPlc() {
         Plc p = new Plc();
         p.on = sp.getBoolean("plcOn", false);
-        p.udp = sp.getBoolean("plcUdp", false);
+        p.server = sp.getBoolean("plcServer", true);
+        p.udp = sp.getBoolean("plcUdp", true);
         p.host = sp.getString("plcHost", p.host);
         p.port = sp.getInt("plcPort", p.port);
         p.dev = sp.getString("plcDev", p.dev);
@@ -101,7 +104,7 @@ public final class Store {
     }
 
     public void savePlc(Plc p) {
-        sp.edit().putBoolean("plcOn", p.on).putBoolean("plcUdp", p.udp).putString("plcHost", p.host)
+        sp.edit().putBoolean("plcOn", p.on).putBoolean("plcServer", p.server).putBoolean("plcUdp", p.udp).putString("plcHost", p.host)
                 .putInt("plcPort", p.port).putString("plcDev", p.dev).putInt("plcHead", p.head).apply();
     }
 

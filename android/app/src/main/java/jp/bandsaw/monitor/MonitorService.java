@@ -105,8 +105,71 @@ public class MonitorService extends Service {
         return (short) Math.max(-32768, Math.min(32767, Math.round(v * 10)));
     }
 
+    // ---- 待受モード（シンプルCPU通信で PLC が読みに来る）
+    private SlmpServer server;
+    private volatile long lastReqAt = 0;
+    private volatile String lastPeer = "";
+    private boolean serverReading = false;
+
+    /** このスマホの Wi-Fi の IPv4 アドレス（PLC の交信先に登録する値） */
+    public static String wifiIp(Context ctx) {
+        try {
+            android.net.ConnectivityManager cm = ctx.getSystemService(android.net.ConnectivityManager.class);
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                if (nc == null || !nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue;
+                android.net.LinkProperties lp = cm.getLinkProperties(n);
+                if (lp == null) continue;
+                for (android.net.LinkAddress la : lp.getLinkAddresses())
+                    if (la.getAddress() instanceof java.net.Inet4Address)
+                        return la.getAddress().getHostAddress() + "/" + la.getPrefixLength();
+            }
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    private void startServer() {
+        try {
+            server = new SlmpServer(plcCfg.port, (peer, cmd, sub, ok) -> {
+                lastReqAt = System.currentTimeMillis();
+                lastPeer = peer;
+                if (!ok) plcStatus = String.format(Locale.JAPAN, "PLC から未対応の要求（コマンド %04X / %04X）を受けました", cmd, sub);
+            });
+            server.start();
+            String ip = wifiIp(this);
+            plcStatus = "PLC からの読出し待ち（このスマホ " + (ip == null ? "Wi-Fi 未接続" : ip) + " ポート " + plcCfg.port + "）";
+        } catch (Exception e) {
+            server = null;
+            plcStatus = "ポート " + plcCfg.port + " で待ち受けできません（" + e.getMessage() + "）";
+            store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, plcStatus);
+        }
+    }
+
+    private void serverUpdate(Core.Result r, boolean stopping) {
+        if (server == null) return;
+        server.setWords(plcCfg.head, plcWords(r, stopping));
+        long now = System.currentTimeMillis();
+        long age = now - lastReqAt;
+        if (lastReqAt == 0) {
+            plcOk = false;
+            String ip = wifiIp(this);
+            plcStatus = "PLC からの読出し待ち（このスマホ " + (ip == null ? "Wi-Fi 未接続" : ip) + " ポート " + plcCfg.port + "）";
+        } else if (age < 5000) {
+            plcOk = true;
+            plcStatus = String.format(Locale.JAPAN, "PLC が読出し中（%s・%.1f秒前）D%d〜D%d", lastPeer, age / 1000.0, plcCfg.head, plcCfg.head + 4);
+            if (!serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC が読出しを始めました（" + lastPeer + "）");
+            serverReading = true;
+        } else {
+            plcOk = false;
+            plcStatus = String.format(Locale.JAPAN, "PLC からの読出しが %d 秒止まっています（最後: %s）", age / 1000, lastPeer);
+            if (serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC からの読出しが途絶えました");
+            serverReading = false;
+        }
+    }
+
     private void sendPlc(Core.Result r, boolean stopping) {
         if (plcCfg == null || !plcCfg.on) return;
+        if (plcCfg.server) { serverUpdate(r, stopping); return; }
         if (!stopping && !plcBusy.compareAndSet(false, true)) return;   // 前回の送信中なら今回は飛ばす
         final short[] w = plcWords(r, stopping);
         Runnable job = () -> {
@@ -238,6 +301,7 @@ public class MonitorService extends Service {
             sendPlc(last, true);          // PLC に「停止」(0) を書いて終わる
         }
         if (slmp != null) { final Slmp s = slmp; plcExec.submit(s::close); slmp = null; }
+        if (server != null) { server.close(); server = null; }
         plcStatus = "";
         running = false;
         state = "IDLE";
@@ -326,6 +390,9 @@ public class MonitorService extends Service {
         plcOk = false;
         plcFailSince = 0;
         plcStatus = plcCfg.on ? "PLC に接続しています…" : "";
+        lastReqAt = 0;
+        serverReading = false;
+        if (plcCfg.on && plcCfg.server) startServer();
         Core.Detector det = new Core.Detector(cfg, srBox[0]);
         synchronized (this) { judge = new Core.Judge(cfg, store.loadBlade()); }
         float[] buf = new float[4096];

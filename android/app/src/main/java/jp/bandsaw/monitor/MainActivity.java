@@ -342,18 +342,37 @@ public class MainActivity extends Activity {
         }
         // ---- PLC
         Store.Plc pc = store.loadPlc();
-        l.addView(tv("PLC への送信（三菱 SLMP / 3Eフレーム バイナリ）", 14, Ui.FG, true), lp(-1, -2, 0, 18));
+        l.addView(tv("PLC との連携（三菱 SLMP）", 14, Ui.FG, true), lp(-1, -2, 0, 18));
         CheckBox plcOn = new CheckBox(this);
-        plcOn.setText("PLC に状態を送る");
+        plcOn.setText("PLC と連携する");
         plcOn.setTextColor(Ui.FG);
         plcOn.setChecked(pc.on);
         l.addView(plcOn);
-        l.addView(tv("PLC の IP アドレス", 12, Ui.MUTED, false), lp(-1, -2, 0, 4));
+        android.widget.RadioGroup mode = new android.widget.RadioGroup(this);
+        android.widget.RadioButton mServer = new android.widget.RadioButton(this), mClient = new android.widget.RadioButton(this);
+        mServer.setId(View.generateViewId());
+        mClient.setId(View.generateViewId());
+        mServer.setText("PLC が読みに来る（シンプルCPU通信）おすすめ");
+        mClient.setText("アプリから PLC に書き込む（RUN中書込みの許可が必要）");
+        mServer.setTextColor(Ui.FG);
+        mClient.setTextColor(Ui.FG);
+        mode.addView(mServer);
+        mode.addView(mClient);
+        mode.check(pc.server ? mServer.getId() : mClient.getId());
+        l.addView(mode, lp(-1, -2, 0, 4));
+
+        String myIp = MonitorService.wifiIp(this);
+        TextView ipInfo = tv("このスマホの IP: " + (myIp == null ? "Wi-Fi 未接続" : myIp) + "\n（PLC の交信先に登録します。スマホは固定IPにしてください）", 12, Ui.ACCENT, false);
+        l.addView(ipInfo, lp(-1, -2, 0, 6));
+
+        TextView ipLabel = tv("PLC の IP アドレス", 12, Ui.MUTED, false);
+        l.addView(ipLabel, lp(-1, -2, 0, 8));
         EditText ip = new EditText(this);
         ip.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         ip.setText(pc.host); ip.setTextColor(Ui.FG); ip.setTypeface(Typeface.MONOSPACE);
         l.addView(ip);
-        l.addView(tv("ポート番号（PLC のパラメータで開けたもの）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        TextView portLabel = tv("", 12, Ui.MUTED, false);
+        l.addView(portLabel, lp(-1, -2, 0, 8));
         EditText port = new EditText(this);
         port.setInputType(InputType.TYPE_CLASS_NUMBER);
         port.setText(String.valueOf(pc.port)); port.setTextColor(Ui.FG); port.setTypeface(Typeface.MONOSPACE);
@@ -363,18 +382,35 @@ public class MainActivity extends Activity {
         udp.setTextColor(Ui.FG);
         udp.setChecked(pc.udp);
         l.addView(udp);
-        l.addView(tv("書き込む先頭デバイス（D / W / R / ZR）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        TextView devLabel = tv("書き込む先頭デバイス（D / W / R / ZR）", 12, Ui.MUTED, false);
+        l.addView(devLabel, lp(-1, -2, 0, 8));
         EditText dev = new EditText(this);
         dev.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
         dev.setText(pc.dev); dev.setTextColor(Ui.FG); dev.setTypeface(Typeface.MONOSPACE);
         l.addView(dev);
-        l.addView(tv("先頭番号（W は16進。ここから連続5語を使います）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        TextView headLabel = tv("", 12, Ui.MUTED, false);
+        l.addView(headLabel, lp(-1, -2, 0, 8));
         EditText head = new EditText(this);
         head.setInputType(InputType.TYPE_CLASS_TEXT);
-        head.setText("W".equalsIgnoreCase(pc.dev) ? Integer.toHexString(pc.head).toUpperCase() : String.valueOf(pc.head));
         head.setTextColor(Ui.FG); head.setTypeface(Typeface.MONOSPACE);
         l.addView(head);
         l.addView(tv("+0 状態（0停止 1準備中 2平常 3学習中 4注意 5警報）\n+1 生存カウンタ（0.5秒ごとに+1）\n+2 30秒平均×10 ／ +3 瞬時×10\n+4 未確認の警報（1=鳴動中）", 12, Ui.MUTED, false), lp(-1, -2, 0, 4));
+        final boolean[] isServer = {pc.server};
+        Runnable applyMode = () -> {
+            boolean sv0 = isServer[0];
+            int vis = sv0 ? View.GONE : View.VISIBLE;
+            ipLabel.setVisibility(vis); ip.setVisibility(vis); udp.setVisibility(vis); devLabel.setVisibility(vis); dev.setVisibility(vis);
+            ipInfo.setVisibility(sv0 ? View.VISIBLE : View.GONE);
+            portLabel.setText(sv0 ? "待ち受けるポート番号（TCP・UDP 両方。PLC の交信先ポートと同じ値）" : "PLC のポート番号（PLC のパラメータで開けたもの）");
+            headLabel.setText(sv0 ? "PLC が読む先頭デバイス（スマホ側の D 番号。ここから連続5語）" : "先頭番号（W は16進。ここから連続5語を書き込みます）");
+        };
+        head.setText(!pc.server && "W".equalsIgnoreCase(pc.dev) ? Integer.toHexString(pc.head).toUpperCase() : String.valueOf(pc.head));
+        applyMode.run();
+        mode.setOnCheckedChangeListener((g, id) -> {
+            isServer[0] = id == mServer.getId();
+            head.setText(isServer[0] ? "0" : "1000");
+            applyMode.run();
+        });
 
         CheckBox snd = new CheckBox(this);
         snd.setText("注意・警報でアラーム音を鳴らす");
@@ -393,6 +429,7 @@ public class MainActivity extends Activity {
                     store.setSoundOn(snd.isChecked());
                     Store.Plc np = new Store.Plc();
                     np.on = plcOn.isChecked();
+                    np.server = isServer[0];
                     np.udp = udp.isChecked();
                     np.host = ip.getText().toString().trim();
                     String dv = dev.getText().toString().trim().toUpperCase(Locale.ROOT);
@@ -400,7 +437,8 @@ public class MainActivity extends Activity {
                     for (String d0 : Slmp.DEVICES) if (d0.equals(dv)) okDev = true;
                     np.dev = okDev ? dv : "D";
                     try { np.port = Integer.parseInt(port.getText().toString().trim()); } catch (NumberFormatException e) { np.port = pc.port; }
-                    try { np.head = Integer.parseInt(head.getText().toString().trim(), "W".equals(np.dev) ? 16 : 10); } catch (NumberFormatException e) { np.head = pc.head; }
+                    try { np.head = Integer.parseInt(head.getText().toString().trim(), (!np.server && "W".equals(np.dev)) ? 16 : 10); } catch (NumberFormatException e) { np.head = pc.head; }
+                    if (np.server) np.head = Math.max(0, Math.min(SlmpServer.MEM - 5, np.head));
                     store.savePlc(np);
                     if (MonitorService.running) {
                         MonitorService.send(this, MonitorService.ACT_STOP);
@@ -463,7 +501,11 @@ public class MainActivity extends Activity {
             avgTv.setText("--.-");
             micTv.setText("");
             Store.Plc pc = store.loadPlc();
-            plcTv.setText(pc.on ? "PLC: 監視開始で " + pc.host + " の " + pc.headName() + "〜 に送信します" : "");
+            if (!pc.on) plcTv.setText("");
+            else if (pc.server) {
+                String ip0 = MonitorService.wifiIp(this);
+                plcTv.setText("PLC: 監視開始で待ち受けます（このスマホ " + (ip0 == null ? "Wi-Fi 未接続" : ip0) + " ポート " + pc.port + "・D" + pc.head + "〜D" + (pc.head + 4) + "）");
+            } else plcTv.setText("PLC: 監視開始で " + pc.host + " の " + pc.headName() + "〜 に書き込みます");
             plcTv.setTextColor(Ui.MUTED);
         } else {
             micTv.setText("マイク: " + MonitorService.micInfo);
