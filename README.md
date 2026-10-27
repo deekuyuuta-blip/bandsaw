@@ -32,3 +32,17 @@
 - 「帯鋸を交換した」で、その帯鋸の最初の10分を基準として学習し、以後は「固定値」と「基準＋上昇幅」の大きい方で判定
 
 このアプリは補助的な予兆検知です。非常停止やカバーなどの安全装置の代わりにはなりません。
+
+## Android アプリ (APK)
+
+画面を消しても監視を続けるアプリです。
+
+**ダウンロード:** https://github.com/deekuyuuta-blip/bandsaw/releases/latest/download/bandsaw.apk
+
+| パス | 内容 |
+|---|---|
+| `android/` | Android アプリのソース（Java） |
+| `android/app/src/main/java/jp/bandsaw/monitor/Core.java` | 判定ロジック（Web 版 `src/core.js` と同じ処理） |
+| `.github/workflows/android.yml` | `android/` を更新すると APK を自動ビルドしてリリースに置く |
+
+`android/app/bandsaw.keystore` は上書きインストールのための署名用の鍵です（社内用）。

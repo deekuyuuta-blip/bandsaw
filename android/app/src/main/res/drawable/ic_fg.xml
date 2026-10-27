@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 帯鋸のループと打音のマーク -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#4FA3E0" android:strokeWidth="6" android:fillColor="#00000000"
+        android:pathData="M38,34 L70,34 A12,12 0 0 1 70,58 L38,58 A12,12 0 0 1 38,34 Z"/>
+    <path android:fillColor="#F0B429"
+        android:pathData="M50,64 L58,64 L56,80 L52,80 Z"/>
+    <path android:fillColor="#EF4A3C"
+        android:pathData="M44,30 L50,22 L52,30 Z"/>
+</vector>
