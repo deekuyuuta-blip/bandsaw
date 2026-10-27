@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14181d">
+<title>帯鋸打音モニター</title>
+<style>
+/* 現場の操作盤: 暗い盤面に状態ランプ。上から 状態 → 操作 → 推移グラフ → 記録 → 検証/設定 */
+:root{
+  --bg:#14181d; --panel:#1c2229; --panel2:#232b34; --line:#323c47;
+  --fg:#e8edf2; --muted:#9aa7b4; --accent:#4fa3e0;
+  --ok:#3fb06a; --warn:#f0b429; --alarm:#ef4a3c; --learn:#8a7cf0;
+  --chart-avg:#4fa3e0; --chart-inst:#3a4f63;
+  --font:"Noto Sans JP","Hiragino Sans","Yu Gothic UI","Meiryo",system-ui,sans-serif;
+  --mono:"Roboto Mono","SFMono-Regular",ui-monospace,monospace;
+  color-scheme:dark;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){--bg:#eef1f4;--panel:#ffffff;--panel2:#f4f6f8;--line:#d5dce3;--fg:#17202a;--muted:#5b6876;--accent:#1f6fb2;--ok:#1f8a4c;--warn:#b57900;--alarm:#d12d20;--learn:#5b4bd1;--chart-avg:#1f6fb2;--chart-inst:#b8c7d6;color-scheme:light}
+}
+:root[data-theme="light"]{--bg:#eef1f4;--panel:#ffffff;--panel2:#f4f6f8;--line:#d5dce3;--fg:#17202a;--muted:#5b6876;--accent:#1f6fb2;--ok:#1f8a4c;--warn:#b57900;--alarm:#d12d20;--learn:#5b4bd1;--chart-avg:#1f6fb2;--chart-inst:#b8c7d6;color-scheme:light}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.55 var(--font);
+  padding-block:max(12px,env(safe-area-inset-top,0px)) max(24px,env(safe-area-inset-bottom,0px));
+  padding-left:max(14px,env(safe-area-inset-left,0px));padding-right:max(14px,env(safe-area-inset-right,0px));}
+.wrap{max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+h1{font-size:18px;margin:0;letter-spacing:.04em}
+.spec{font:12px var(--mono);color:var(--muted)}
+.num{font-variant-numeric:tabular-nums;font-family:var(--mono)}
+
+/* 状態ランプ */
+.lamp{border-radius:14px;padding:16px;background:var(--panel);border:2px solid var(--line);display:grid;gap:10px;transition:border-color .2s}
+.lamp .row1{display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap}
+.state{font-size:30px;font-weight:800;letter-spacing:.08em;display:flex;align-items:center;gap:10px}
+.dot{width:18px;height:18px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 4px color-mix(in srgb,var(--muted) 25%,transparent)}
+.big{font:700 44px/1 var(--mono);font-variant-numeric:tabular-nums}
+.big small{font-size:16px;color:var(--muted);font-weight:500;margin-left:4px}
+.msg{font-size:15px;font-weight:600;min-height:1.5em}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.metric{background:var(--panel2);border-radius:8px;padding:6px 8px;min-width:0}
+.metric b{display:block;font:600 17px var(--mono);font-variant-numeric:tabular-nums}
+.metric span{font-size:11px;color:var(--muted);letter-spacing:.03em}
+.th{font-size:12px;color:var(--muted)}
+.lamp[data-s="NORMAL"]{border-color:var(--ok)} .lamp[data-s="NORMAL"] .dot{background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 30%,transparent)}
+.lamp[data-s="WARN"]{border-color:var(--warn)} .lamp[data-s="WARN"] .dot{background:var(--warn);box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 30%,transparent)} .lamp[data-s="WARN"] .state{color:var(--warn)}
+.lamp[data-s="ALARM"]{border-color:var(--alarm);background:color-mix(in srgb,var(--alarm) 14%,var(--panel))} .lamp[data-s="ALARM"] .dot{background:var(--alarm)} .lamp[data-s="ALARM"] .state{color:var(--alarm)}
+.lamp[data-s="LEARN"]{border-color:var(--learn)} .lamp[data-s="LEARN"] .dot{background:var(--learn)}
+.lamp.flash{animation:flash 1s steps(2) infinite}
+@keyframes flash{50%{background:var(--alarm);color:#fff}}
+@media (prefers-reduced-motion:reduce){.lamp.flash{animation:none}}
+.prog{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden}
+.prog i{display:block;height:100%;width:0;background:var(--learn);transition:width .5s}
+
+/* ボタン */
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{font:600 15px var(--font);border-radius:10px;padding:14px 12px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer;min-height:52px}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary.on{background:var(--panel2);color:var(--fg);border-color:var(--line)}
+button.ack{grid-column:1/-1;background:var(--alarm);border-color:var(--alarm);color:#fff;font-size:18px}
+button.small{min-height:40px;padding:8px 12px;font-size:13px}
+button:disabled{opacity:.45}
+
+section.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:grid;gap:10px;min-width:0}
+section.card h2{font-size:14px;margin:0;color:var(--muted);letter-spacing:.06em;display:flex;justify-content:space-between;align-items:center;gap:8px}
+canvas{width:100%;height:190px;display:block}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted)}
+.legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:4px}
+ul.log{list-style:none;margin:0;padding:0;max-height:260px;overflow:auto;font-size:13px}
+ul.log li{display:grid;grid-template-columns:68px 1fr auto;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);align-items:baseline}
+ul.log li:last-child{border-bottom:0}
+.tag{font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;background:var(--panel2);white-space:nowrap}
+.tag.ALARM,.tag.BREAK{background:var(--alarm);color:#fff}.tag.WARN{background:var(--warn);color:#000}.tag.LEARNED,.tag.BASE_HIGH,.tag.LEARN{background:var(--learn);color:#fff}
+.empty{color:var(--muted);font-size:13px}
+details{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:0 14px}
+details[open]{padding-bottom:14px}
+summary{cursor:pointer;padding:14px 0;font-weight:700;font-size:15px}
+.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.form label{display:grid;gap:3px;font-size:12px;color:var(--muted);min-width:0}
+.form input,.form select{font:16px var(--mono);padding:9px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);width:100%}
+.form .full{grid-column:1/-1}
+.note{font-size:13px;color:var(--muted);margin:0}
+.note b{color:var(--fg)}
+.banner{border-radius:10px;padding:10px 12px;font-size:13px;background:color-mix(in srgb,var(--warn) 18%,var(--panel));border:1px solid var(--warn)}
+.help li{margin-bottom:4px}
+.help{font-size:13px;padding-left:18px;margin:6px 0}
+@media (max-width:420px){.metrics{grid-template-columns:repeat(2,1fr)}.big{font-size:38px}.state{font-size:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>帯鋸打音モニター</h1>
+    <span class="spec num" id="spec"></span>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <div class="lamp" id="lamp" data-s="IDLE" aria-live="polite">
+    <div class="row1">
+      <div class="state"><span class="dot"></span><span id="stateTxt">停止中</span></div>
+      <div class="big"><span id="avgTxt">--.-</span><small>dB</small></div>
+    </div>
+    <div class="msg" id="msgTxt">「監視開始」を押すと、マイクで帯鋸の音を聞き始めます。</div>
+    <div class="prog" id="progWrap" hidden><i id="prog"></i></div>
+    <div class="metrics">
+      <div class="metric"><span>瞬時スコア</span><b id="mInst">--</b></div>
+      <div class="metric"><span>周期</span><b id="mFreq">--</b></div>
+      <div class="metric"><span>周波数の安定度</span><b id="mLock">--</b></div>
+      <div class="metric"><span>マイク音量</span><b id="mLvl">--</b></div>
+    </div>
+    <div class="th num" id="thTxt"></div>
+  </div>
+
+  <div class="btns">
+    <button class="ack" id="ackBtn" hidden>警報を確認（音を止める）</button>
+    <button class="primary" id="startBtn">監視開始</button>
+    <button id="bladeBtn">帯鋸を交換した</button>
+  </div>
+  <div class="btns" id="bladeConfirm" hidden>
+    <p class="note full" style="grid-column:1/-1">新しい帯鋸で切削を始めてください。<b><span id="learnMinTxt">10</span>分間の切削音</b>を、この帯鋸の「平常時の基準」として覚えます。き裂がある帯鋸で覚えさせないよう、<b>取り付けた直後</b>に押してください。</p>
+    <button class="primary" id="bladeYes">基準を覚え直す</button>
+    <button id="bladeNo">やめる</button>
+  </div>
+
+  <section class="card">
+    <h2><span>推移（直近15分）</span><span class="num" id="baseTxt"></span></h2>
+    <canvas id="chart" aria-label="打音スコアの推移グラフ"></canvas>
+    <div class="legend"><span><i style="background:var(--chart-avg)"></i>30秒平均</span><span><i style="background:var(--chart-inst)"></i>瞬時</span><span><i style="background:var(--warn)"></i>注意</span><span><i style="background:var(--alarm)"></i>警報</span></div>
+  </section>
+
+  <section class="card">
+    <h2><span>記録</span><span style="display:flex;gap:6px"><button class="small" id="saveWavBtn" hidden>直前30秒の音を保存</button><button class="small" id="csvBtn">記録を保存</button></span></h2>
+    <ul class="log" id="log"></ul>
+  </section>
+
+  <details id="fileBox">
+    <summary>録画ファイルで検証する</summary>
+    <div class="form">
+      <label class="full">動画または音声ファイル（CAM9の録画など）<input type="file" id="fileIn" accept="video/*,audio/*"></label>
+      <label>録画の開始時刻（任意）<input type="text" id="fileStart" placeholder="12:58:45" inputmode="numeric"></label>
+      <label>判定の基準<select id="fileBase">
+        <option value="fixed">固定のしきい値</option>
+        <option value="blade">今の帯鋸の基準</option>
+        <option value="learn">ファイルの最初で学習</option>
+      </select></label>
+      <button class="primary full" id="fileRun" disabled>検証する</button>
+    </div>
+    <p class="note" id="fileStatus"></p>
+    <canvas id="fileChart" hidden aria-label="ファイルの打音スコア"></canvas>
+    <ul class="log" id="fileLog"></ul>
+  </details>
+
+  <details>
+    <summary>設定</summary>
+    <div class="form" id="cfgForm">
+      <label>帯鋸の全長 (mm)<input type="number" id="c_bladeMm" step="1"></label>
+      <label>ホイール直径 (mm)<input type="number" id="c_wheelMm" step="1"></label>
+      <label>ホイール回転数 最小 (rpm)<input type="number" id="c_rpmMin" step="1"></label>
+      <label>ホイール回転数 最大 (rpm)<input type="number" id="c_rpmMax" step="1"></label>
+      <label>注意: 30秒平均 (dB)<input type="number" id="c_warnAvg" step="0.5"></label>
+      <label>警報: 30秒平均 (dB)<input type="number" id="c_alarmAvg" step="0.5"></label>
+      <label>警報: 瞬時 (dB)<input type="number" id="c_alarmInst" step="0.5"></label>
+      <label>基準を覚える時間 (分)<input type="number" id="c_learnMin" step="1" min="1"></label>
+      <label>基準からの上昇で注意 (dB)<input type="number" id="c_riseWarn" step="0.5"></label>
+      <label>基準からの上昇で警報 (dB)<input type="number" id="c_riseAlarm" step="0.5"></label>
+      <label>停止とみなす音量 (dB)<input type="number" id="c_idleDb" step="1"></label>
+      <label>警報音・振動<select id="c_sound"><option value="on">鳴らす</option><option value="off">鳴らさない</option></select></label>
+      <button class="full" id="cfgSave">設定を保存</button>
+      <button class="full" id="testBtn">警報をテストする</button>
+    </div>
+    <p class="note">帯鋸の基準を覚えたあとは「固定のしきい値」と「基準＋上昇幅」の大きい方で判定します。最初から規則的な音がする帯鋸でも、その音を基準にして、そこからの増加で判定します。</p>
+  </details>
+
+  <details>
+    <summary>使い方と注意</summary>
+    <ul class="help">
+      <li>スマホを帯鋸の近く（上下ホイールやガイドの音が届く場所）に固定し、<b>充電器につないだまま</b>使ってください。</li>
+      <li><b>画面は消さずに、このページを表示したまま</b>にしてください。画面が消えたり別のアプリに切り替えると、監視が止まります（止まっていた時間は記録に残ります）。</li>
+      <li>帯鋸を交換したら、取り付けた直後に「帯鋸を交換した」を押します。最初の切削音を、その帯鋸の平常時の基準として覚えます。</li>
+      <li><b>注意</b>: 帯鋸1周ごとの打音が続いています。早めに止めて、溶接部を中心に点検してください。<br><b>警報</b>: 打音が強くなっています。できるだけ早く止めて交換し、機械に近づかないでください。</li>
+      <li>このアプリは補助的な予兆検知です。非常停止やカバーなどの安全装置の代わりにはなりません。</li>
+      <li>2026/10/27 の CAM9 録画では、溶接部の割れの打音が出てから破断まで約10分でした。</li>
+    </ul>
+  </details>
+</div>
+
+<script>
+// ===== 帯鋸 打音監視 判定コア (ブラウザ/Node 共通) =====
+const BandsawCore = (function () {
+  "use strict";
+
+  // ---- 2次IIR (RBJ) ----
+  function biquad(type, f, Q, sr) {
+    const w = 2 * Math.PI * f / sr, c = Math.cos(w), s = Math.sin(w), a = s / (2 * Q);
+    let b0, b1, b2;
+    if (type === "lp") { b0 = (1 - c) / 2; b1 = 1 - c; b2 = (1 - c) / 2; }
+    else { b0 = (1 + c) / 2; b1 = -(1 + c); b2 = (1 + c) / 2; }
+    const a0 = 1 + a, a1 = -2 * c, a2 = 1 - a;
+    return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0, z2: 0 };
+  }
+  // 4次Butterworth = Q 0.5412 と 1.3066 の2段
+  function makeBand(lo, hi, sr) {
+    return [biquad("hp", lo, 0.5412, sr), biquad("hp", lo, 1.3066, sr),
+            biquad("lp", hi, 0.5412, sr), biquad("lp", hi, 1.3066, sr)];
+  }
+
+  // ---- FFT (radix-2, in place) ----
+  function fftPow(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), h = len >> 1;
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < h; k++) {
+          const a = i + k, b = a + h;
+          const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+          const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+        }
+      }
+    }
+    const p = new Float64Array(n / 2 + 1);
+    for (let i = 0; i <= n / 2; i++) p[i] = re[i] * re[i] + im[i] * im[i];
+    return p;
+  }
+  function median(arr) {
+    const a = Float64Array.from(arr).sort(); const n = a.length;
+    if (!n) return NaN;
+    return n % 2 ? a[(n - 1) >> 1] : (a[n / 2 - 1] + a[n / 2]) / 2;
+  }
+  function pct(arr, q) {
+    const a = Float64Array.from(arr).sort(); if (!a.length) return NaN;
+    const i = (a.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+    return a[lo] + (a[hi] - a[lo]) * (i - lo);
+  }
+
+  const DEFAULTS = {
+    bladeMm: 8350, wheelMm: 1200, rpmMin: 720, rpmMax: 830,
+    bandLo: 1500, bandHi: 4000, windowSec: 8.5, hopSec: 0.5, idleDb: -60,
+    avgSec: 30, lockRatio: 0.7,
+    warnAvg: 8, alarmAvg: 11, alarmInst: 14, alarmHold: 3,
+    riseWarn: 4, riseAlarm: 7, riseInst: 5,
+    learnMin: 10, learnAlarmAvg: 16,
+    clearHold: 240
+  };
+
+  function bladeRange(c) {
+    const circ = Math.PI * c.wheelMm / 1000, L = c.bladeMm / 1000;
+    return [c.rpmMin / 60 * circ / L, c.rpmMax / 60 * circ / L];
+  }
+
+  // ---- 検出器: 音声サンプルを入れると hop ごとに結果を返す ----
+  function Detector(cfg, sr) {
+    const c = Object.assign({}, DEFAULTS, cfg);
+    const B = Math.max(1, Math.round(sr / 200)), envFs = sr / B;
+    const winN = Math.round(c.windowSec * envFs), hopN = Math.round(c.hopSec * envFs);
+    const filt = makeBand(c.bandLo, c.bandHi, sr);
+    const env = new Float64Array(winN); let envLen = 0, envPos = 0;
+    let acc = 0, accN = 0, hopCnt = 0, fullAcc = 0, peak = 0, fullN = 0;
+    const fullHist = [];
+    const NFFT = 16384, fr = envFs / NFFT;
+    const [fmin, fmax] = bladeRange(c);
+    const hann = new Float64Array(winN);
+    const out = [];
+
+    function prominence(P, f) {
+      let pk = 0; const nb = [];
+      const i0 = Math.max(1, Math.floor((f - 1.5) / fr)), i1 = Math.min(P.length - 1, Math.ceil((f + 1.5) / fr));
+      for (let i = i0; i <= i1; i++) {
+        const d = Math.abs(i * fr - f);
+        if (d <= 0.1) pk = Math.max(pk, P[i]);
+        else if (d > 0.25 && d < 1.5) nb.push(P[i]);
+      }
+      return 10 * Math.log10(pk / (median(nb) + 1e-30) + 1e-30);
+    }
+
+    function analyze() {
+      // 時系列順に取り出す
+      const n = winN, e = new Float64Array(n);
+      for (let i = 0; i < n; i++) e[i] = Math.log(env[(envPos + i) % n] + 1e-6);
+      // 2Hz未満の変化を除去 (移動平均を引く, same)
+      const k2 = Math.floor(envFs / 2), half = Math.floor(k2 / 2);
+      const cs = new Float64Array(n + 1);
+      for (let i = 0; i < n; i++) cs[i + 1] = cs[i] + e[i];
+      const t0 = Math.floor(envFs / 4), m = n - 2 * t0;
+      if (hann.length !== m) { }
+      const re = new Float64Array(NFFT), im = new Float64Array(NFFT);
+      for (let j = 0; j < m; j++) {
+        const i = j + t0;
+        const a = Math.max(0, i - half), b = Math.min(n, i - half + k2);
+        const ma = (cs[b] - cs[a]) / k2;
+        const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * j / (m - 1));
+        re[j] = (e[i] - ma) * w;
+      }
+      const P = fftPow(re, im);
+      let best = -1, f0 = fmin;
+      for (let i = Math.ceil(fmin / fr); i <= Math.floor(fmax / fr); i++) if (P[i] > best) { best = P[i]; f0 = i * fr; }
+      const p1 = prominence(P, f0), p2 = prominence(P, 2 * f0);
+      return { freq: f0, p1, p2, score: (p1 + p2) / 2 };
+    }
+
+    // x: Float32Array
+    this.push = function (x) {
+      for (let i = 0; i < x.length; i++) {
+        let v = x[i];
+        const a = Math.abs(v); if (a > peak) peak = a;
+        fullAcc += v * v; fullN++;
+        for (let k = 0; k < 4; k++) {
+          const f = filt[k];
+          const y = f.b0 * v + f.z1; f.z1 = f.b1 * v - f.a1 * y + f.z2; f.z2 = f.b2 * v - f.a2 * y; v = y;
+        }
+        acc += v * v; accN++;
+        if (accN === B) {
+          env[envPos] = Math.sqrt(acc / B + 1e-12); envPos = (envPos + 1) % winN;
+          if (envLen < winN) envLen++;
+          acc = 0; accN = 0; hopCnt++;
+          if (hopCnt === hopN) {
+            hopCnt = 0;
+            let s2 = 0; for (let j = 0; j < winN; j++) s2 += env[j] * env[j];
+            const bandDb = envLen ? 20 * Math.log10(Math.sqrt(s2 / envLen) + 1e-9) : -120;
+            const fullDb = 20 * Math.log10(Math.sqrt(fullAcc / Math.max(1, fullN)) + 1e-9);
+            const prev = fullHist.length >= 4 ? median(fullHist) : null;
+            fullHist.push(fullDb); if (fullHist.length > Math.round(5 / c.hopSec)) fullHist.shift();
+            const r = { bandDb, fullDb, peak, jumpDb: prev === null ? 0 : fullDb - prev,
+                        ready: envLen >= winN, freq: NaN, score: NaN };
+            if (r.ready) Object.assign(r, analyze());
+            out.push(r);
+            fullAcc = 0; fullN = 0; peak = 0;
+          }
+        }
+      }
+      return out.splice(0);
+    };
+    this.envFs = envFs; this.range = [fmin, fmax];
+  }
+
+  // ---- 判定 (帯鋸ごとの基準つき) ----
+  // blade: {learning:bool, hops:[], inst:[], base:{p90,inst99,med}|null}
+  function Judge(cfg, blade) {
+    const c = Object.assign({}, DEFAULTS, cfg);
+    const histN = Math.max(2, Math.round(c.avgSec / c.hopSec));
+    const hs = [], hf = [];
+    let state = "NORMAL", nAlarm = 0, nClear = 0, lastF = null, breakCool = 0;
+    this.blade = blade || { learning: false, avgs: [], inst: [], base: null };
+    const learnNeed = Math.round(c.learnMin * 60 / c.hopSec);
+
+    this.thresholds = () => {
+      const b = this.blade.base;
+      if (!b) return { warn: c.warnAvg, alarmAvg: c.alarmAvg, inst: c.alarmInst, mode: this.blade.learning ? "learning" : "fixed" };
+      return { warn: Math.max(c.warnAvg, b.p90 + c.riseWarn), alarmAvg: Math.max(c.alarmAvg, b.p90 + c.riseAlarm),
+               inst: Math.max(c.alarmInst, b.inst99 + c.riseInst), mode: "blade" };
+    };
+    this.state = () => state;
+    this.startLearning = () => { this.blade = { learning: true, avgs: [], inst: [], base: null, started: Date.now() }; state = "NORMAL"; nClear = 0; nAlarm = 0; };
+    this.learnProgress = () => this.blade.learning ? Math.min(1, this.blade.avgs.length / learnNeed) : (this.blade.base ? 1 : 0);
+
+    this.update = (r) => {
+      const ev = [];
+      breakCool = Math.max(0, breakCool - 1);
+      if (r.jumpDb >= 8 && r.peak >= 0.9 && breakCool === 0) {
+        ev.push(state === "NORMAL" ? "LOUD" : "BREAK"); breakCool = Math.round(10 / c.hopSec);
+      }
+      if (!r.ready || isNaN(r.score) || r.bandDb < c.idleDb) { r.state = state === "NORMAL" ? "IDLE" : state; return ev; }
+      const s = r.score;
+      hs.push(s); hf.push(r.freq); if (hs.length > histN) { hs.shift(); hf.shift(); }
+      const full = hs.length >= histN * 0.8;
+      const avg = hs.reduce((a, b) => a + b, 0) / hs.length;
+      const mf = median(hf); let lk = 0; for (const f of hf) if (Math.abs(f - mf) <= 0.06) lk++;
+      const lock = lk / hf.length;
+      r.avg = avg; r.lock = lock;
+      const sustained = full && lock >= c.lockRatio;
+
+      // 学習中: 平均スコアを集める。極端に強い打音だけは警報
+      const bl = this.blade;
+      if (bl.learning) {
+        if (full) { bl.avgs.push(avg); bl.inst.push(s); }
+        if (bl.avgs.length >= learnNeed) {
+          bl.base = { p90: pct(bl.avgs, 0.9), inst99: pct(bl.inst, 0.99), med: median(bl.avgs), at: Date.now() };
+          bl.learning = false; bl.avgs = []; bl.inst = [];
+          ev.push(bl.base.p90 >= c.warnAvg ? "BASE_HIGH" : "LEARNED");
+        }
+      }
+      const th = this.thresholds();
+      if (lastF !== null && Math.abs(r.freq - lastF) > 0.1) nAlarm = 0;
+      lastF = r.freq;
+      let next = state;
+      if (bl.learning) {
+        if (sustained && avg >= c.learnAlarmAvg) next = "ALARM";
+      } else {
+        nAlarm = s >= th.inst ? nAlarm + 1 : 0;
+        if (nAlarm >= c.alarmHold || (sustained && avg >= th.alarmAvg)) next = "ALARM";
+        else if (sustained && avg >= th.warn && state === "NORMAL") next = "WARN";
+      }
+      if (state !== "NORMAL" && full && avg < th.warn - 3) {
+        if (++nClear >= c.clearHold) { next = "NORMAL"; nClear = 0; ev.push("CLEAR"); }
+      } else nClear = 0;
+      const L = ["NORMAL", "WARN", "ALARM"];
+      if (L.indexOf(next) > L.indexOf(state)) ev.push(next);
+      state = next;
+      r.state = state; r.th = th;
+      return ev;
+    };
+    this.reset = () => { state = "NORMAL"; nAlarm = 0; nClear = 0; };
+  }
+
+  return { Detector, Judge, DEFAULTS, bladeRange, median, pct };
+})();
+if (typeof module !== "undefined") module.exports = BandsawCore;
+
+</script>
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const store={get(k,d){try{const v=localStorage.getItem("bsm_"+k);return v?JSON.parse(v):d}catch(e){return d}},
+             set(k,v){try{localStorage.setItem("bsm_"+k,JSON.stringify(v))}catch(e){}}};
+const CFG_KEYS=["bladeMm","wheelMm","rpmMin","rpmMax","warnAvg","alarmAvg","alarmInst","learnMin","riseWarn","riseAlarm","idleDb"];
+let cfg=Object.assign({},BandsawCore.DEFAULTS,{sound:"on"},store.get("cfg",{}));
+let blade=store.get("blade",{learning:false,avgs:[],inst:[],base:null});
+let events=store.get("events",[]);
+
+// ---------- 表示ヘルパ ----------
+const pad=n=>String(n).padStart(2,"0");
+const hms=d=>pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+const ymdhms=d=>d.getFullYear()+"/"+pad(d.getMonth()+1)+"/"+pad(d.getDate())+" "+hms(d);
+const f1=v=>(v==null||isNaN(v))?"--":v.toFixed(1);
+const LABEL={ALARM:"警報",WARN:"注意",BREAK:"破断音",LOUD:"大きな音",CLEAR:"解除",LEARNED:"基準OK",BASE_HIGH:"基準",LEARN:"交換",GAP:"中断",START:"開始",STOP:"停止",TEST:"テスト"};
+const TEXT={ALARM:"帯鋸1周ごとの打音が強い。できるだけ早く停止・交換",WARN:"帯鋸1周ごとの打音あり。早めに停止して溶接部を点検",
+  BREAK:"注意・警報中に大きな異常音",LOUD:"大きな音（記録のみ）",CLEAR:"打音が平常に戻った",LEARN:"帯鋸交換。基準の学習を開始",
+  START:"監視開始",STOP:"監視停止",TEST:"警報テスト"};
+
+function renderSpec(){
+  const [a,b]=BandsawCore.bladeRange(cfg);
+  $("spec").textContent=`帯鋸 ${cfg.bladeMm}mm / ホイール ${cfg.wheelMm}mm / 1周 ${a.toFixed(2)}〜${b.toFixed(2)}Hz`;
+  $("learnMinTxt").textContent=cfg.learnMin;
+  const bb=blade.base;
+  $("baseTxt").textContent=blade.learning?"基準を学習中":bb?`この帯鋸の基準 ${bb.p90.toFixed(1)}dB`:"基準なし（固定値で判定）";
+}
+function addEvent(type,score,when,extra){
+  const e={t:(when||new Date()).getTime(),type,score:(score==null||isNaN(score))?null:+score.toFixed(1),text:extra||TEXT[type]||""};
+  events.unshift(e); if(events.length>500) events.length=500; store.set("events",events); renderLog($("log"),events);
+}
+function renderLog(ul,list){
+  ul.textContent="";
+  if(!list.length){const li=document.createElement("li");li.className="empty";li.style.display="block";li.textContent="まだ記録はありません。";ul.appendChild(li);return;}
+  for(const e of list.slice(0,200)){
+    const li=document.createElement("li");
+    const t=document.createElement("span");t.className="num";t.textContent=hms(new Date(e.t));
+    const m=document.createElement("span");const tag=document.createElement("span");tag.className="tag "+e.type;tag.textContent=LABEL[e.type]||e.type;
+    m.appendChild(tag);m.appendChild(document.createTextNode(" "+e.text));
+    const s=document.createElement("span");s.className="num";s.textContent=e.score==null?"":e.score.toFixed(1)+"dB";
+    li.append(t,m,s);ul.appendChild(li);
+  }
+}
+
+// ---------- グラフ ----------
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
+function drawChart(cv,pts,t0,t1,th,marks){
+  const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  if(!w) return;
+  cv.width=w*dpr;cv.height=h*dpr;const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);
+  const L=30,R=6,T=8,B=20,ymax=Math.max(24,...pts.map(p=>p.s||0).filter(isFinite))+1;
+  const X=t=>L+(t-t0)/(t1-t0||1)*(w-L-R),Y=v=>T+(1-Math.max(0,v)/ymax)*(h-T-B);
+  g.font="11px "+css("--mono");g.fillStyle=css("--muted");g.strokeStyle=css("--line");g.lineWidth=1;
+  for(let v=0;v<=ymax;v+=5){g.beginPath();g.moveTo(L,Y(v));g.lineTo(w-R,Y(v));g.stroke();g.fillText(String(v),4,Y(v)+4);}
+  const span=(t1-t0)/1000,maxLab=Math.max(2,Math.floor((w-L-R)/64));let step=[30,60,120,180,300,600,900,1800,3600].find(s=>span/s<=maxLab)||3600;
+  g.textAlign="center";
+  for(let s=Math.ceil(t0/1000/step)*step;s*1000<=t1;s+=step){const d=new Date(s*1000);g.fillText(pad(d.getHours())+":"+pad(d.getMinutes())+(step<60?":"+pad(d.getSeconds()):""),X(s*1000),h-5);}
+  g.textAlign="left";
+  if(th){[[th.warn,"--warn",[6,4]],[th.alarmAvg,"--alarm",[2,3]],[th.inst,"--alarm",[6,4]]].forEach(([v,c,d])=>{g.strokeStyle=css(c);g.setLineDash(d);g.beginPath();g.moveTo(L,Y(v));g.lineTo(w-R,Y(v));g.stroke();});g.setLineDash([]);}
+  const line=(key,col,lw)=>{g.strokeStyle=css(col);g.lineWidth=lw;g.beginPath();let on=false,last=0;
+    for(const p of pts){const v=p[key];if(v==null||!isFinite(v)||p.t-last>5000){on=false;}if(v==null||!isFinite(v)){last=p.t;continue;}
+      if(!on){g.moveTo(X(p.t),Y(v));on=true}else g.lineTo(X(p.t),Y(v));last=p.t;}g.stroke();};
+  line("s","--chart-inst",1);line("a","--chart-avg",2.4);
+  for(const m of (marks||[])){g.strokeStyle=css(m.type==="WARN"?"--warn":"--alarm");g.lineWidth=2;g.beginPath();g.moveTo(X(m.t),T);g.lineTo(X(m.t),h-B);g.stroke();
+    g.fillStyle=g.strokeStyle;g.font="bold 11px "+css("--font");g.fillText(LABEL[m.type]||m.type,Math.min(X(m.t)+3,w-40),T+11);}
+}
+
+// ---------- 警報 (音・振動・点滅) ----------
+let ctx=null,siren=null,alarmOn=false,vibTimer=null;
+function startSiren(level){
+  alarmOn=true;$("ackBtn").hidden=false;$("lamp").classList.toggle("flash",level==="ALARM"||level==="BREAK");
+  if(cfg.sound!=="on"||!ctx) return;
+  stopSound();
+  const o=ctx.createOscillator(),gn=ctx.createGain(),lfo=ctx.createOscillator(),lg=ctx.createGain();
+  o.type="square";o.frequency.value=level==="WARN"?880:1200;lfo.frequency.value=level==="WARN"?1:3;lg.gain.value=level==="WARN"?200:400;
+  lfo.connect(lg);lg.connect(o.frequency);gn.gain.value=0.25;o.connect(gn);gn.connect(ctx.destination);o.start();lfo.start();siren={o,lfo};
+  if(navigator.vibrate){const pat=level==="WARN"?[400,1600]:[700,300];const v=()=>navigator.vibrate(pat);v();vibTimer=setInterval(v,2000);}
+}
+function stopSound(){if(siren){try{siren.o.stop();siren.lfo.stop()}catch(e){}siren=null}if(vibTimer){clearInterval(vibTimer);vibTimer=null;try{navigator.vibrate(0)}catch(e){}}}
+$("ackBtn").onclick=()=>{stopSound();alarmOn=false;$("ackBtn").hidden=true;$("lamp").classList.remove("flash");};
+
+// ---------- ライブ監視 ----------
+let running=false,stream=null,src=null,proc=null,det=null,judge=null,live=[],lastHop=0,wakeLock=null;
+let ring=null,ringPos=0,ringSr=48000;
+function setLamp(s,msg){
+  const map={IDLE:"停止中",NORMAL:"平常",WARN:"注意",ALARM:"警報",LEARN:"学習中",WAIT:"準備中"};
+  $("lamp").dataset.s=s;$("stateTxt").textContent=map[s]||s;if(msg!=null)$("msgTxt").textContent=msg;
+}
+function thText(th){
+  if(!th) return "";
+  const mode={fixed:"固定のしきい値",learning:"基準を学習中",blade:"この帯鋸の基準から"}[th.mode];
+  return `${mode}　注意 平均${th.warn.toFixed(1)}dB ／ 警報 平均${th.alarmAvg.toFixed(1)}dB・瞬時${th.inst.toFixed(1)}dB`;
+}
+async function requestWake(){try{if("wakeLock" in navigator&&document.visibilityState==="visible"){wakeLock=await navigator.wakeLock.request("screen");}}catch(e){}}
+document.addEventListener("visibilitychange",()=>{if(running&&document.visibilityState==="visible")requestWake();});
+
+async function start(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    showBanner("このブラウザではマイクが使えません。Android の Chrome でこのファイルを開いてください。（ファイルを開く方法は同梱の説明を参照）");return;}
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+  }catch(e){
+    if(location.protocol==="content:"||!window.isSecureContext)
+      showBanner("マイクを使えませんでした。ファイル管理アプリから開くと（content://）Chrome はマイクを許可しません。Chrome のアドレス欄に file:///sdcard/Download/bandsaw-monitor.html と入力して開き直してください。");
+    else showBanner("マイクを使えませんでした（"+(e.name||e)+"）。アドレス欄左のアイコン →「権限」でマイクを「許可」にしてから、もう一度「監視開始」を押してください。");
+    return;}
+  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();
+  await ctx.resume();
+  src=ctx.createMediaStreamSource(stream);
+  proc=ctx.createScriptProcessor(4096,1,1);
+  det=new BandsawCore.Detector(cfg,ctx.sampleRate);
+  judge=new BandsawCore.Judge(cfg,blade);
+  ringSr=ctx.sampleRate;ring=new Float32Array(ringSr*30);ringPos=0;
+  proc.onaudioprocess=ev=>{
+    const x=ev.inputBuffer.getChannelData(0);
+    for(let i=0;i<x.length;i++){ring[ringPos]=x[i];ringPos=(ringPos+1)%ring.length;}
+    for(const r of det.push(x)) onHop(r);
+    ev.outputBuffer.getChannelData(0).fill(0);
+  };
+  src.connect(proc);proc.connect(ctx.destination);
+  running=true;lastHop=Date.now();
+  $("startBtn").textContent="監視停止";$("startBtn").classList.add("on");
+  setLamp(blade.learning?"LEARN":"WAIT","音を集めています（約10秒）…");
+  addEvent("START");requestWake();
+}
+function stop(){
+  running=false;
+  try{proc&&proc.disconnect();src&&src.disconnect();stream&&stream.getTracks().forEach(t=>t.stop());}catch(e){}
+  try{wakeLock&&wakeLock.release();}catch(e){}
+  $("startBtn").textContent="監視開始";$("startBtn").classList.remove("on");
+  setLamp("IDLE","監視を止めています。");addEvent("STOP");
+}
+$("startBtn").onclick=()=>running?stop():start();
+
+function onHop(r){
+  const now=new Date();
+  if(now-lastHop>5000) addEvent("GAP",null,new Date(lastHop),`監視が ${Math.round((now-lastHop)/1000)}秒 止まっていました（画面オフ等）`);
+  lastHop=now.getTime();
+  const evs=judge.update(r);
+  blade=judge.blade;
+  live.push({t:now.getTime(),s:r.score,a:r.avg});
+  const cut=now.getTime()-15*60*1000;while(live.length&&live[0].t<cut)live.shift();
+  for(const e of evs){
+    if(e==="LEARNED"||e==="BASE_HIGH"){
+      const b=blade.base;
+      addEvent(e,b.p90,now,e==="BASE_HIGH"?`この帯鋸は最初から規則的な打音あり（基準 ${b.p90.toFixed(1)}dB）。念のため溶接部を確認。以後は基準からの増加で判定`:`基準を覚えました（${b.p90.toFixed(1)}dB）`);
+    }else addEvent(e,r.score,now);
+    if(e==="WARN"||e==="ALARM"||e==="BREAK"){startSiren(e);$("saveWavBtn").hidden=false;}
+    if(e==="CLEAR"){stopSound();$("ackBtn").hidden=true;$("lamp").classList.remove("flash");}
+  }
+  if(evs.some(e=>e==="LEARNED"||e==="BASE_HIGH")||evs.length) {store.set("blade",blade);renderSpec();}
+  // 表示
+  $("mInst").textContent=f1(r.score);$("mFreq").textContent=isNaN(r.freq)?"--":r.freq.toFixed(2)+"Hz";
+  $("mLock").textContent=r.lock==null?"--":r.lock.toFixed(2);$("mLvl").textContent=f1(r.fullDb);
+  $("avgTxt").textContent=f1(r.avg);
+  const st=judge.state();
+  if(!r.ready){setLamp(blade.learning?"LEARN":"WAIT","音を集めています（約10秒）…");}
+  else if(r.state==="IDLE"){setLamp("WAIT","音が小さすぎます（停止中？）。マイクを帯鋸に近づけてください。");}
+  else if(st==="ALARM")setLamp("ALARM","帯鋸1周ごとの打音が強い。できるだけ早く止めて交換。機械に近づかない");
+  else if(st==="WARN")setLamp("WARN","帯鋸1周ごとの打音あり。早めに止めて溶接部を点検");
+  else if(blade.learning)setLamp("LEARN",`この帯鋸の基準を学習中（${Math.round(judge.learnProgress()*100)}%）。強い打音のときだけ警報します`);
+  else setLamp("NORMAL","き裂の打音は出ていません");
+  $("progWrap").hidden=!blade.learning;$("prog").style.width=(judge.learnProgress()*100)+"%";
+  $("thTxt").textContent=thText(r.th||judge.thresholds());
+  if(blade.learning&&live.length%20===0)store.set("blade",blade);
+  const tNow=now.getTime();
+  drawChart($("chart"),live,tNow-15*60*1000,tNow,judge.thresholds(),events.filter(e=>(e.type==="WARN"||e.type==="ALARM")&&e.t>tNow-15*60*1000));
+}
+
+// ---------- 帯鋸交換 ----------
+$("bladeBtn").onclick=()=>{$("bladeConfirm").hidden=false;};
+$("bladeNo").onclick=()=>{$("bladeConfirm").hidden=true;};
+$("bladeYes").onclick=()=>{
+  $("bladeConfirm").hidden=true;
+  blade={learning:true,avgs:[],inst:[],base:null,started:Date.now()};
+  if(judge){judge.startLearning();blade=judge.blade;}
+  store.set("blade",blade);stopSound();$("ackBtn").hidden=true;$("lamp").classList.remove("flash");
+  addEvent("LEARN");renderSpec();
+  if(!running)setLamp("LEARN","「監視開始」を押すと、この帯鋸の基準を学習し始めます。");
+};
+
+// ---------- 保存 ----------
+function download(name,blob){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},2000);}
+$("csvBtn").onclick=()=>{
+  const rows=[["日時","種類","スコアdB","内容"]].concat(events.slice().reverse().map(e=>[ymdhms(new Date(e.t)),LABEL[e.type]||e.type,e.score==null?"":e.score,'"'+(e.text||"").replace(/"/g,'""')+'"']));
+  download("帯鋸記録_"+new Date().toISOString().slice(0,10)+".csv",new Blob(["﻿"+rows.map(r=>r.join(",")).join("\r\n")],{type:"text/csv"}));
+};
+$("saveWavBtn").onclick=()=>{
+  if(!ring) return;
+  const n=ring.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
+  const ws=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+  ws(0,"RIFF");v.setUint32(4,36+n*2,true);ws(8,"WAVEfmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,ringSr,true);v.setUint32(28,ringSr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,"data");v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){const s=Math.max(-1,Math.min(1,ring[(ringPos+i)%n]));v.setInt16(44+i*2,s*32767,true);}
+  const d=new Date();download(`帯鋸_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.wav`,new Blob([buf],{type:"audio/wav"}));
+};
+
+// ---------- 設定 ----------
+function loadForm(){for(const k of CFG_KEYS)$("c_"+k).value=cfg[k];$("c_sound").value=cfg.sound;}
+$("cfgSave").onclick=()=>{
+  for(const k of CFG_KEYS){const v=parseFloat($("c_"+k).value);if(isFinite(v))cfg[k]=v;}
+  cfg.sound=$("c_sound").value;store.set("cfg",cfg);renderSpec();
+  $("cfgSave").textContent="保存しました";setTimeout(()=>$("cfgSave").textContent="設定を保存",1500);
+  if(running){stop();start();}
+};
+$("testBtn").onclick=async()=>{
+  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();
+  startSiren("ALARM");addEvent("TEST");setTimeout(()=>{if(alarmOn&&!running){$("ackBtn").click();}},4000);
+};
+
+// ---------- ファイル検証 ----------
+let fileObj=null;
+$("fileIn").onchange=e=>{fileObj=e.target.files[0]||null;$("fileRun").disabled=!fileObj;$("fileStatus").textContent=fileObj?fileObj.name:"";};
+$("fileRun").onclick=async()=>{
+  if(!fileObj) return;
+  const st=$("fileStatus");$("fileRun").disabled=true;st.textContent="読み込み中…";
+  try{
+    const ab=await fileObj.arrayBuffer();
+    const actx=new (window.AudioContext||window.webkitAudioContext)();
+    const au=await actx.decodeAudioData(ab);actx.close&&actx.close();
+    const sr=au.sampleRate,n=au.length,ch=au.numberOfChannels,x=new Float32Array(n);
+    for(let c=0;c<ch;c++){const d=au.getChannelData(c);for(let i=0;i<n;i++)x[i]+=d[i]/ch;}
+    let t0=new Date();t0.setMilliseconds(0);
+    const m=($("fileStart").value||"").match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if(m){t0.setHours(+m[1],+m[2],+(m[3]||0),0);}else{t0=new Date(2000,0,1,0,0,0);}
+    const mode=$("fileBase").value;
+    const fb=mode==="blade"&&blade.base?{learning:false,avgs:[],inst:[],base:blade.base}:mode==="learn"?{learning:true,avgs:[],inst:[],base:null}:{learning:false,avgs:[],inst:[],base:null};
+    const d=new BandsawCore.Detector(cfg,sr),j=new BandsawCore.Judge(cfg,fb);
+    const pts=[],evs=[];let t=0;const step=sr*5;
+    for(let i=0;i<n;i+=step){
+      for(const r of d.push(x.subarray(i,Math.min(n,i+step)))){t+=cfg.hopSec||0.5;const tm=t0.getTime()+t*1000;
+        const e=j.update(r);pts.push({t:tm,s:r.score,a:r.avg});
+        for(const ty of e){if(ty==="LEARNED"||ty==="BASE_HIGH")evs.unshift({t:tm,type:ty,score:j.blade.base.p90,text:"基準 "+j.blade.base.p90.toFixed(1)+"dB"});else evs.unshift({t:tm,type:ty,score:r.score,text:TEXT[ty]||""});}}
+      st.textContent=`解析中… ${Math.round(i/n*100)}%`;await new Promise(r=>setTimeout(r,0));
+    }
+    const sc=pts.map(p=>p.s).filter(isFinite),av=pts.map(p=>p.a).filter(v=>v!=null&&isFinite(v));
+    const mx=a=>a.length?Math.max(...a).toFixed(1):"--";
+    st.textContent=`${(n/sr).toFixed(0)}秒を解析。瞬時スコア 最大${mx(sc)}dB ／ 30秒平均 最大${mx(av)}dB。`+(evs.some(e=>e.type==="ALARM"||e.type==="WARN")?"注意または警報あり。":"発報なし。");
+    $("fileChart").hidden=false;
+    drawChart($("fileChart"),pts,pts.length?pts[0].t:0,pts.length?pts[pts.length-1].t:1,j.thresholds(),evs.filter(e=>e.type==="WARN"||e.type==="ALARM"));
+    renderLog($("fileLog"),evs.filter(e=>e.type!=="LOUD"||true));
+  }catch(e){st.textContent="このファイルは読み込めませんでした（"+(e.message||e)+"）。mp4・m4a・wav などの音声付きファイルを選んでください。";}
+  $("fileRun").disabled=false;
+};
+
+function showBanner(t){$("banner").hidden=false;$("banner").textContent=t;}
+
+// ---------- 起動 ----------
+loadForm();renderSpec();renderLog($("log"),events);
+if(blade.learning)setLamp("LEARN","帯鋸の基準を学習する準備ができています。「監視開始」を押してください。");
+$("thTxt").textContent=thText(new BandsawCore.Judge(cfg,blade).thresholds());
+drawChart($("chart"),[],Date.now()-15*60*1000,Date.now(),new BandsawCore.Judge(cfg,blade).thresholds(),[]);
+if(location.protocol==="content:"||!window.isSecureContext){
+  showBanner("この開き方ではマイクが使えません（アドレスが "+location.protocol+"// で始まっています）。Chrome のアドレス欄に file:///sdcard/Download/bandsaw-monitor.html と入力して開き直すか、https:// のアドレスに置いて開いてください。");
+  $("startBtn").dataset.blocked="1";
+}
+window.addEventListener("resize",()=>{if(!running)drawChart($("chart"),live,Date.now()-15*60*1000,Date.now(),new BandsawCore.Judge(cfg,blade).thresholds(),[]);});
+})();
+</script>
+</body>
+</html>
