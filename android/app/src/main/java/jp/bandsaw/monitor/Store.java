@@ -77,6 +77,34 @@ public final class Store {
     public boolean soundOn() { return sp.getBoolean("sound", true); }
     public void setSoundOn(boolean on) { sp.edit().putBoolean("sound", on).apply(); }
 
+    // ---------------- PLC（SLMP）
+    public static final class Plc {
+        public boolean on = false, udp = false;
+        public String host = "192.168.3.39", dev = "D";
+        public int port = 5000, head = 1000;
+
+        /** 画面表示用の先頭デバイス名（W は16進表記） */
+        public String headName() {
+            return "W".equalsIgnoreCase(dev) ? "W" + Integer.toHexString(head).toUpperCase() : dev.toUpperCase() + head;
+        }
+    }
+
+    public Plc loadPlc() {
+        Plc p = new Plc();
+        p.on = sp.getBoolean("plcOn", false);
+        p.udp = sp.getBoolean("plcUdp", false);
+        p.host = sp.getString("plcHost", p.host);
+        p.port = sp.getInt("plcPort", p.port);
+        p.dev = sp.getString("plcDev", p.dev);
+        p.head = sp.getInt("plcHead", p.head);
+        return p;
+    }
+
+    public void savePlc(Plc p) {
+        sp.edit().putBoolean("plcOn", p.on).putBoolean("plcUdp", p.udp).putString("plcHost", p.host)
+                .putInt("plcPort", p.port).putString("plcDev", p.dev).putInt("plcHead", p.head).apply();
+    }
+
     // ---------------- 帯鋸の基準
     public Core.Blade loadBlade() {
         Core.Blade b = new Core.Blade();

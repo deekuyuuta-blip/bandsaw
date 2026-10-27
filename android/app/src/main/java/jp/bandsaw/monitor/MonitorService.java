@@ -56,6 +56,87 @@ public class MonitorService extends Service {
     /** 直近15分 {時刻ms, 瞬時, 30秒平均} */
     public static final ArrayDeque<double[]> history = new ArrayDeque<>();
     public static volatile Runnable listener = null;
+    /** PLC 送信の状況（画面表示用） */
+    public static volatile String plcStatus = "";
+    public static volatile boolean plcOk = false;
+
+    // ---- PLC 送信（音声処理を止めないよう別スレッド）
+    private final java.util.concurrent.ExecutorService plcExec = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean plcBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private Slmp slmp;
+    private Store.Plc plcCfg;
+    private int heartbeat = 0;
+    private long plcFailSince = 0;
+
+    /** D(n)=状態 0停止 1準備中 2平常 3学習中 4注意 5警報 / D(n+1)=生存カウンタ / D(n+2)=平均×10 / D(n+3)=瞬時×10 / D(n+4)=未確認の警報 */
+    private short[] plcWords(Core.Result r, boolean stopping) {
+        int st;
+        if (stopping) st = 0;
+        else if (r == null || !r.ready || "IDLE".equals(r.state)) st = 1;
+        else if ("ALARM".equals(state)) st = 5;
+        else if ("WARN".equals(state)) st = 4;
+        else if (judge != null && judge.blade.learning) st = 3;
+        else st = 2;
+        heartbeat = (heartbeat + 1) & 0x7FFF;
+        return new short[]{(short) st, (short) heartbeat, x10(r == null ? Double.NaN : r.avg),
+                x10(r == null ? Double.NaN : r.score), (short) (alarming && !stopping ? 1 : 0)};
+    }
+
+    /**
+     * 工場の Wi-Fi はインターネットにつながっていないことが多く、その場合 Android は通信を
+     * モバイル回線に流してしまう。PLC への通信は必ず Wi-Fi を通るようにする。
+     */
+    private void bindToWifi() {
+        try {
+            android.net.ConnectivityManager cm = getSystemService(android.net.ConnectivityManager.class);
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                if (nc != null && nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                    cm.bindProcessToNetwork(n);
+                    return;
+                }
+            }
+            cm.bindProcessToNetwork(null);
+        } catch (Exception ignored) { }
+    }
+
+    private static short x10(double v) {
+        if (Double.isNaN(v)) return 0;
+        return (short) Math.max(-32768, Math.min(32767, Math.round(v * 10)));
+    }
+
+    private void sendPlc(Core.Result r, boolean stopping) {
+        if (plcCfg == null || !plcCfg.on) return;
+        if (!stopping && !plcBusy.compareAndSet(false, true)) return;   // 前回の送信中なら今回は飛ばす
+        final short[] w = plcWords(r, stopping);
+        Runnable job = () -> {
+            try {
+                if (slmp == null) {
+                    bindToWifi();
+                    slmp = new Slmp(plcCfg.host, plcCfg.port, plcCfg.udp);
+                }
+                slmp.writeWords(plcCfg.dev, plcCfg.head, w);
+                if (!plcOk) store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC に接続しました（" + plcCfg.host + " " + plcCfg.headName() + "〜）");
+                plcOk = true;
+                plcFailSince = 0;
+                plcStatus = "PLC 送信中: " + plcCfg.host + ":" + plcCfg.port + (plcCfg.udp ? " UDP " : " TCP ") + plcCfg.headName() + "〜";
+            } catch (Exception e) {
+                long now = System.currentTimeMillis();
+                if (plcOk || plcFailSince == 0) {
+                    plcFailSince = now;
+                    store.addEvent(now, "PLC", Double.NaN, "PLC に送れません: " + e.getMessage());
+                }
+                plcOk = false;
+                plcStatus = "PLC に送れません（" + e.getMessage() + "）。再接続を続けます";
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) { }
+            } finally {
+                plcBusy.set(false);
+            }
+        };
+        if (stopping) {
+            try { plcExec.submit(job).get(3, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) { }
+        } else plcExec.submit(job);
+    }
 
     private Thread worker;
     private volatile boolean stopFlag;
@@ -151,7 +232,13 @@ public class MonitorService extends Service {
             try { worker.join(1500); } catch (InterruptedException ignored) { }
             worker = null;
         }
-        if (running) store.addEvent(System.currentTimeMillis(), "STOP", Double.NaN, "監視停止");
+        if (running) {
+            store.addEvent(System.currentTimeMillis(), "STOP", Double.NaN, "監視停止");
+            alarming = false;
+            sendPlc(last, true);          // PLC に「停止」(0) を書いて終わる
+        }
+        if (slmp != null) { final Slmp s = slmp; plcExec.submit(s::close); slmp = null; }
+        plcStatus = "";
         running = false;
         state = "IDLE";
         stopAlarmSound();
@@ -234,6 +321,11 @@ public class MonitorService extends Service {
             return;
         }
         Core.Config cfg = store.loadConfig();
+        plcCfg = store.loadPlc();
+        slmp = null;
+        plcOk = false;
+        plcFailSince = 0;
+        plcStatus = plcCfg.on ? "PLC に接続しています…" : "";
         Core.Detector det = new Core.Detector(cfg, srBox[0]);
         synchronized (this) { judge = new Core.Judge(cfg, store.loadBlade()); }
         float[] buf = new float[4096];
@@ -261,6 +353,7 @@ public class MonitorService extends Service {
                         while (!history.isEmpty() && history.peekFirst()[0] < now - 15 * 60 * 1000) history.removeFirst();
                     }
                     for (String e : evs) handleEvent(e, r, now);
+                    sendPlc(r, false);
                     if (!evs.isEmpty() || (judge.blade.learning && ++saveCnt % 120 == 0)) store.saveBlade(judge.blade);
                     if (now - lastStatusUpdate > 5000) {
                         lastStatusUpdate = now;

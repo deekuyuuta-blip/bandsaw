@@ -46,3 +46,7 @@
 | `.github/workflows/android.yml` | `android/` を更新すると APK を自動ビルドしてリリースに置く |
 
 `android/app/bandsaw.keystore` は上書きインストールのための署名用の鍵です（社内用）。
+
+## PLC への信号（三菱 Q / iQ-R）
+
+Android アプリから SLMP（MCプロトコル 3Eフレーム）で PLC のワードデバイス（例 D1000〜D1004）に状態を書き込み、表示灯・ブザーに使えます。設定とラダー例は [docs/PLC接続.md](docs/PLC接続.md)。

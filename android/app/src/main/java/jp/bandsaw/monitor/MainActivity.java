@@ -41,6 +41,7 @@ public class MainActivity extends Activity {
     private Store store;
     private float dp;
     private LinearLayout card;
+    private TextView plcTv;
     private TextView stateTv, avgTv, msgTv, instTv, freqTv, lockTv, lvlTv, thTv, micTv, banner, baseTv, logTv, specTv;
     private ProgressBar prog;
     private Button startBtn, ackBtn, batteryBtn;
@@ -164,6 +165,8 @@ public class MainActivity extends Activity {
         card.addView(thTv, lp(-1, -2, 0, 8));
         micTv = tv("", 11, Ui.MUTED, false);
         card.addView(micTv);
+        plcTv = tv("", 12, Ui.MUTED, true);
+        card.addView(plcTv, lp(-1, -2, 0, 4));
         root.addView(card, lp(-1, -2, 0, 14));
 
         ackBtn = button("警報を確認（音を止める）", Ui.ALARM, 0xFFFFFFFF);
@@ -337,6 +340,42 @@ public class MainActivity extends Activity {
             l.addView(e);
             eds[i] = e;
         }
+        // ---- PLC
+        Store.Plc pc = store.loadPlc();
+        l.addView(tv("PLC への送信（三菱 SLMP / 3Eフレーム バイナリ）", 14, Ui.FG, true), lp(-1, -2, 0, 18));
+        CheckBox plcOn = new CheckBox(this);
+        plcOn.setText("PLC に状態を送る");
+        plcOn.setTextColor(Ui.FG);
+        plcOn.setChecked(pc.on);
+        l.addView(plcOn);
+        l.addView(tv("PLC の IP アドレス", 12, Ui.MUTED, false), lp(-1, -2, 0, 4));
+        EditText ip = new EditText(this);
+        ip.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        ip.setText(pc.host); ip.setTextColor(Ui.FG); ip.setTypeface(Typeface.MONOSPACE);
+        l.addView(ip);
+        l.addView(tv("ポート番号（PLC のパラメータで開けたもの）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        EditText port = new EditText(this);
+        port.setInputType(InputType.TYPE_CLASS_NUMBER);
+        port.setText(String.valueOf(pc.port)); port.setTextColor(Ui.FG); port.setTypeface(Typeface.MONOSPACE);
+        l.addView(port);
+        CheckBox udp = new CheckBox(this);
+        udp.setText("UDP で送る（チェックなしは TCP）");
+        udp.setTextColor(Ui.FG);
+        udp.setChecked(pc.udp);
+        l.addView(udp);
+        l.addView(tv("書き込む先頭デバイス（D / W / R / ZR）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        EditText dev = new EditText(this);
+        dev.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+        dev.setText(pc.dev); dev.setTextColor(Ui.FG); dev.setTypeface(Typeface.MONOSPACE);
+        l.addView(dev);
+        l.addView(tv("先頭番号（W は16進。ここから連続5語を使います）", 12, Ui.MUTED, false), lp(-1, -2, 0, 8));
+        EditText head = new EditText(this);
+        head.setInputType(InputType.TYPE_CLASS_TEXT);
+        head.setText("W".equalsIgnoreCase(pc.dev) ? Integer.toHexString(pc.head).toUpperCase() : String.valueOf(pc.head));
+        head.setTextColor(Ui.FG); head.setTypeface(Typeface.MONOSPACE);
+        l.addView(head);
+        l.addView(tv("+0 状態（0停止 1準備中 2平常 3学習中 4注意 5警報）\n+1 生存カウンタ（0.5秒ごとに+1）\n+2 30秒平均×10 ／ +3 瞬時×10\n+4 未確認の警報（1=鳴動中）", 12, Ui.MUTED, false), lp(-1, -2, 0, 4));
+
         CheckBox snd = new CheckBox(this);
         snd.setText("注意・警報でアラーム音を鳴らす");
         snd.setTextColor(Ui.FG);
@@ -352,6 +391,17 @@ public class MainActivity extends Activity {
                     }
                     store.saveConfig(c);
                     store.setSoundOn(snd.isChecked());
+                    Store.Plc np = new Store.Plc();
+                    np.on = plcOn.isChecked();
+                    np.udp = udp.isChecked();
+                    np.host = ip.getText().toString().trim();
+                    String dv = dev.getText().toString().trim().toUpperCase(Locale.ROOT);
+                    boolean okDev = false;
+                    for (String d0 : Slmp.DEVICES) if (d0.equals(dv)) okDev = true;
+                    np.dev = okDev ? dv : "D";
+                    try { np.port = Integer.parseInt(port.getText().toString().trim()); } catch (NumberFormatException e) { np.port = pc.port; }
+                    try { np.head = Integer.parseInt(head.getText().toString().trim(), "W".equals(np.dev) ? 16 : 10); } catch (NumberFormatException e) { np.head = pc.head; }
+                    store.savePlc(np);
                     if (MonitorService.running) {
                         MonitorService.send(this, MonitorService.ACT_STOP);
                         h.postDelayed(() -> MonitorService.send(this, MonitorService.ACT_START), 1200);
@@ -412,8 +462,13 @@ public class MainActivity extends Activity {
             setLamp("停止中", Ui.MUTED, learning ? "「監視開始」を押すと、この帯鋸の基準を学習し始めます。" : "「監視開始」を押すと、マイクで帯鋸の音を聞き始めます。画面を消しても監視を続けます。");
             avgTv.setText("--.-");
             micTv.setText("");
+            Store.Plc pc = store.loadPlc();
+            plcTv.setText(pc.on ? "PLC: 監視開始で " + pc.host + " の " + pc.headName() + "〜 に送信します" : "");
+            plcTv.setTextColor(Ui.MUTED);
         } else {
             micTv.setText("マイク: " + MonitorService.micInfo);
+            plcTv.setText(MonitorService.plcStatus);
+            plcTv.setTextColor(MonitorService.plcOk ? Ui.OK : Ui.WARN);
             String st = MonitorService.state;
             if (r == null || !r.ready) setLamp("準備中", Ui.MUTED, "音を集めています（約10秒）…");
             else if ("IDLE".equals(r.state)) setLamp("準備中", Ui.MUTED, "音が小さすぎます（停止中？）。マイクを帯鋸に近づけてください。");
@@ -453,6 +508,7 @@ public class MainActivity extends Activity {
             case "START": return "開始";
             case "STOP": return "停止";
             case "TEST": return "テスト";
+            case "PLC": return "PLC";
             default: return t;
         }
     }
