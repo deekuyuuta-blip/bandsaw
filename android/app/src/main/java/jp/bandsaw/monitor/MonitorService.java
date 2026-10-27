@@ -18,6 +18,7 @@ import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.media.RingtoneManager;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -28,24 +29,40 @@ import android.os.Vibrator;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * マイクで帯鋸の音を聞き続けるフォアグラウンドサービス。
- * 画面を消しても監視を続け、注意・警報で通知・アラーム音・振動を出す。
+ *
+ *  ・監視中: マイクで音を聞いて判定し、注意・警報で通知・アラーム音・振動を出す。画面を消しても続ける。
+ *  ・待機中: PLC 連携（PLC が読みに来る方式）のときだけ。マイクは止め、PLC からの読出しと指令
+ *            （開始・停止・帯鋸交換・警報確認・設定反映）を待ち受ける。
  */
 public class MonitorService extends Service {
     public static final String ACT_START = "jp.bandsaw.monitor.START";
     public static final String ACT_STOP = "jp.bandsaw.monitor.STOP";
+    public static final String ACT_QUIT = "jp.bandsaw.monitor.QUIT";
+    /** PLC 待受だけを始める（マイクは使わない） */
+    public static final String ACT_STANDBY = "jp.bandsaw.monitor.STANDBY";
     public static final String ACT_LEARN = "jp.bandsaw.monitor.LEARN";
     public static final String ACT_ACK = "jp.bandsaw.monitor.ACK";
+    private static final String ACT_TEST = "jp.bandsaw.monitor.TEST";
 
     private static final String CH_STATUS = "status";
     private static final String CH_ALARM = "alarm2";
     private static final int ID_STATUS = 1, ID_ALARM = 2;
 
-    // ---- 画面と共有する状態（メインスレッドからも読む）
+    // ---- 画面と共有する状態
+    /** マイクで監視中 */
     public static volatile boolean running = false;
+    /** サービスが動いている（監視中または待機中） */
+    public static volatile boolean alive = false;
     public static volatile boolean alarming = false;
     public static volatile Core.Result last = null;
     public static volatile String state = "IDLE";
@@ -56,165 +73,55 @@ public class MonitorService extends Service {
     /** 直近15分 {時刻ms, 瞬時, 30秒平均} */
     public static final ArrayDeque<double[]> history = new ArrayDeque<>();
     public static volatile Runnable listener = null;
-    /** PLC 送信の状況（画面表示用） */
     public static volatile String plcStatus = "";
     public static volatile boolean plcOk = false;
 
-    // ---- PLC 送信（音声処理を止めないよう別スレッド）
-    private final java.util.concurrent.ExecutorService plcExec = java.util.concurrent.Executors.newSingleThreadExecutor();
-    private final java.util.concurrent.atomic.AtomicBoolean plcBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
-    private Slmp slmp;
+    private Store store;
+    private Vibrator vibrator;
+    private MediaPlayer player;
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private Thread worker;
+    private volatile boolean stopFlag;
+    private Core.Judge judge;
+    private Core.Config cfg;
     private Store.Plc plcCfg;
-    private int heartbeat = 0;
-    private long plcFailSince = 0;
+    private long lastStatusUpdate = 0;
+    private final AtomicInteger heartbeat = new AtomicInteger();
 
-    /** D(n)=状態 0停止 1準備中 2平常 3学習中 4注意 5警報 / D(n+1)=生存カウンタ / D(n+2)=平均×10 / D(n+3)=瞬時×10 / D(n+4)=未確認の警報 */
-    private short[] plcWords(Core.Result r, boolean stopping) {
-        int st;
-        if (stopping) st = 0;
-        else if (r == null || !r.ready || "IDLE".equals(r.state)) st = 1;
-        else if ("ALARM".equals(state)) st = 5;
-        else if ("WARN".equals(state)) st = 4;
-        else if (judge != null && judge.blade.learning) st = 3;
-        else st = 2;
-        heartbeat = (heartbeat + 1) & 0x7FFF;
-        return new short[]{(short) st, (short) heartbeat, x10(r == null ? Double.NaN : r.avg),
-                x10(r == null ? Double.NaN : r.score), (short) (alarming && !stopping ? 1 : 0)};
-    }
-
-    /**
-     * 工場の Wi-Fi はインターネットにつながっていないことが多く、その場合 Android は通信を
-     * モバイル回線に流してしまう。PLC への通信は必ず Wi-Fi を通るようにする。
-     */
-    private void bindToWifi() {
-        try {
-            android.net.ConnectivityManager cm = getSystemService(android.net.ConnectivityManager.class);
-            for (android.net.Network n : cm.getAllNetworks()) {
-                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
-                if (nc != null && nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
-                    cm.bindProcessToNetwork(n);
-                    return;
-                }
-            }
-            cm.bindProcessToNetwork(null);
-        } catch (Exception ignored) { }
-    }
-
-    private static short x10(double v) {
-        if (Double.isNaN(v)) return 0;
-        return (short) Math.max(-32768, Math.min(32767, Math.round(v * 10)));
-    }
-
-    // ---- 待受モード（シンプルCPU通信で PLC が読みに来る）
+    // PLC: 待受（シンプルCPU通信）
     private SlmpServer server;
+    private PlcLink link;
     private volatile long lastReqAt = 0;
     private volatile String lastPeer = "";
     private boolean serverReading = false;
+    // PLC: アプリから書込み
+    private final ExecutorService plcExec = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean plcBusy = new AtomicBoolean(false);
+    private Slmp slmp;
+    private long plcFailSince = 0;
 
-    /** このスマホの Wi-Fi の IPv4 アドレス（PLC の交信先に登録する値） */
-    public static String wifiIp(Context ctx) {
-        try {
-            android.net.ConnectivityManager cm = ctx.getSystemService(android.net.ConnectivityManager.class);
-            for (android.net.Network n : cm.getAllNetworks()) {
-                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
-                if (nc == null || !nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue;
-                android.net.LinkProperties lp = cm.getLinkProperties(n);
-                if (lp == null) continue;
-                for (android.net.LinkAddress la : lp.getLinkAddresses())
-                    if (la.getAddress() instanceof java.net.Inet4Address)
-                        return la.getAddress().getHostAddress() + "/" + la.getPrefixLength();
+    /** 待機中に PLC への状態更新と指令の確認をする（0.5秒ごと） */
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() {
+            if (!alive) return;
+            if (link != null) {
+                pollCommands();
+                if (!running) publishLink(null);
             }
-        } catch (Exception ignored) { }
-        return null;
-    }
-
-    private void startServer() {
-        try {
-            server = new SlmpServer(plcCfg.port, (peer, cmd, sub, ok) -> {
-                lastReqAt = System.currentTimeMillis();
-                lastPeer = peer;
-                if (!ok) plcStatus = String.format(Locale.JAPAN, "PLC から未対応の要求（コマンド %04X / %04X）を受けました", cmd, sub);
-            });
-            server.start();
-            String ip = wifiIp(this);
-            plcStatus = "PLC からの読出し待ち（このスマホ " + (ip == null ? "Wi-Fi 未接続" : ip) + " ポート " + plcCfg.port + "）";
-        } catch (Exception e) {
-            server = null;
-            plcStatus = "ポート " + plcCfg.port + " で待ち受けできません（" + e.getMessage() + "）";
-            store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, plcStatus);
+            main.postDelayed(this, 500);
         }
-    }
-
-    private void serverUpdate(Core.Result r, boolean stopping) {
-        if (server == null) return;
-        server.setWords(plcCfg.head, plcWords(r, stopping));
-        long now = System.currentTimeMillis();
-        long age = now - lastReqAt;
-        if (lastReqAt == 0) {
-            plcOk = false;
-            String ip = wifiIp(this);
-            plcStatus = "PLC からの読出し待ち（このスマホ " + (ip == null ? "Wi-Fi 未接続" : ip) + " ポート " + plcCfg.port + "）";
-        } else if (age < 5000) {
-            plcOk = true;
-            plcStatus = String.format(Locale.JAPAN, "PLC が読出し中（%s・%.1f秒前）D%d〜D%d", lastPeer, age / 1000.0, plcCfg.head, plcCfg.head + 4);
-            if (!serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC が読出しを始めました（" + lastPeer + "）");
-            serverReading = true;
-        } else {
-            plcOk = false;
-            plcStatus = String.format(Locale.JAPAN, "PLC からの読出しが %d 秒止まっています（最後: %s）", age / 1000, lastPeer);
-            if (serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC からの読出しが途絶えました");
-            serverReading = false;
-        }
-    }
-
-    private void sendPlc(Core.Result r, boolean stopping) {
-        if (plcCfg == null || !plcCfg.on) return;
-        if (plcCfg.server) { serverUpdate(r, stopping); return; }
-        if (!stopping && !plcBusy.compareAndSet(false, true)) return;   // 前回の送信中なら今回は飛ばす
-        final short[] w = plcWords(r, stopping);
-        Runnable job = () -> {
-            try {
-                if (slmp == null) {
-                    bindToWifi();
-                    slmp = new Slmp(plcCfg.host, plcCfg.port, plcCfg.udp);
-                }
-                slmp.writeWords(plcCfg.dev, plcCfg.head, w);
-                if (!plcOk) store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC に接続しました（" + plcCfg.host + " " + plcCfg.headName() + "〜）");
-                plcOk = true;
-                plcFailSince = 0;
-                plcStatus = "PLC 送信中: " + plcCfg.host + ":" + plcCfg.port + (plcCfg.udp ? " UDP " : " TCP ") + plcCfg.headName() + "〜";
-            } catch (Exception e) {
-                long now = System.currentTimeMillis();
-                if (plcOk || plcFailSince == 0) {
-                    plcFailSince = now;
-                    store.addEvent(now, "PLC", Double.NaN, "PLC に送れません: " + e.getMessage());
-                }
-                plcOk = false;
-                plcStatus = "PLC に送れません（" + e.getMessage() + "）。再接続を続けます";
-                try { Thread.sleep(1000); } catch (InterruptedException ignored) { }
-            } finally {
-                plcBusy.set(false);
-            }
-        };
-        if (stopping) {
-            try { plcExec.submit(job).get(3, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) { }
-        } else plcExec.submit(job);
-    }
-
-    private Thread worker;
-    private volatile boolean stopFlag;
-    private PowerManager.WakeLock wakeLock;
-    private MediaPlayer player;
-    private Vibrator vibrator;
-    private Store store;
-    private Core.Judge judge;
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private long lastStatusUpdate = 0;
+    };
 
     public static void send(Context ctx, String action) {
         Intent i = new Intent(ctx, MonitorService.class).setAction(action);
-        if (ACT_START.equals(action)) ctx.startForegroundService(i);
+        if (ACT_START.equals(action) || ACT_STANDBY.equals(action)) ctx.startForegroundService(i);
         else ctx.startService(i);
+    }
+
+    public static void testAlarm(Context ctx) {
+        ctx.startService(new Intent(ctx, MonitorService.class).setAction(ACT_TEST));
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -238,78 +145,73 @@ public class MonitorService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String a = intent != null ? intent.getAction() : ACT_START;
-        if (a == null) a = ACT_START;
+        String a = intent != null && intent.getAction() != null ? intent.getAction() : ACT_START;
         switch (a) {
-            case ACT_START: startMonitoring(); break;
-            case ACT_STOP: stopMonitoring(); break;
-            case ACT_LEARN: startLearning(); break;
+            case ACT_START:
+                if (goForeground()) { setupLink(); startMic(); }
+                break;
+            case ACT_STANDBY:
+                if (goForeground()) {
+                    setupLink();
+                    if (link == null) {
+                        if (error == null) error = "PLC 待受を始められませんでした。設定の「PLC と連携する」と方式を確認してください。";
+                        quit();
+                    } else {
+                        getSystemService(NotificationManager.class).notify(ID_STATUS, statusNotification("待機中（PLC からの指令を待っています）"));
+                    }
+                }
+                break;
+            case ACT_STOP:
+                stopMic();
+                if (link == null) quit();          // PLC 待受がなければ完全に止める
+                break;
+            case ACT_QUIT: quit(); break;
+            case ACT_LEARN:
+                startLearning();
+                if (!alive) stopSelf();
+                break;
             case ACT_ACK:
                 acknowledge();
-                if (!running) stopSelf();
+                if (!alive) stopSelf();
                 break;
-            case "jp.bandsaw.monitor.TEST":
+            case ACT_TEST:
                 store.addEvent(System.currentTimeMillis(), "TEST", Double.NaN, "警報テスト");
                 raiseAlarm("ALARM");
-                main.postDelayed(() -> { if (!running) { acknowledge(); stopSelf(); } }, 5000);
+                main.postDelayed(() -> { if (!running) { acknowledge(); if (!alive) stopSelf(); } }, 5000);
                 break;
         }
-        return running ? START_STICKY : START_NOT_STICKY;
+        notifyUi();
+        return alive ? START_STICKY : START_NOT_STICKY;
     }
 
-    // ------------------------------------------------------------ 開始・停止
-    private void startMonitoring() {
-        Notification n = statusNotification("監視を開始しています…");
+    // ------------------------------------------------------------ サービスの起動・終了
+    private boolean goForeground() {
+        if (alive) return true;
         try {
+            Notification n = statusNotification("起動しています…");
             if (Build.VERSION.SDK_INT >= 29) startForeground(ID_STATUS, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
             else startForeground(ID_STATUS, n);
         } catch (Exception e) {
             error = "監視を始められませんでした（" + e.getClass().getSimpleName() + "）。アプリを開いた状態で「監視開始」を押してください。";
-            notifyUi();
             stopSelf();
-            return;
+            return false;
         }
-        if (running) return;
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            error = "マイクの許可がありません。";
-            notifyUi();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
-            return;
-        }
+        alive = true;
         error = null;
-        running = true;
-        stopFlag = false;
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bandsaw:monitor");
         wakeLock.acquire();
-        store.addEvent(System.currentTimeMillis(), "START", Double.NaN, "監視開始");
-        worker = new Thread(this::loop, "bandsaw-audio");
-        worker.start();
-        notifyUi();
+        return true;
     }
 
-    private void stopMonitoring() {
-        stopFlag = true;
-        if (worker != null) {
-            try { worker.join(1500); } catch (InterruptedException ignored) { }
-            worker = null;
-        }
-        if (running) {
-            store.addEvent(System.currentTimeMillis(), "STOP", Double.NaN, "監視停止");
-            alarming = false;
-            sendPlc(last, true);          // PLC に「停止」(0) を書いて終わる
-        }
-        if (slmp != null) { final Slmp s = slmp; plcExec.submit(s::close); slmp = null; }
-        if (server != null) { server.close(); server = null; }
-        plcStatus = "";
-        running = false;
+    private void quit() {
+        stopMic();
+        main.removeCallbacks(ticker);
+        closeLink();
+        alive = false;
         state = "IDLE";
-        stopAlarmSound();
-        alarming = false;
-        if (judge != null) store.saveBlade(judge.blade);
+        acknowledge();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-        getSystemService(NotificationManager.class).cancel(ID_ALARM);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
         notifyUi();
@@ -319,14 +221,100 @@ public class MonitorService extends Service {
     public void onDestroy() {
         stopFlag = true;
         running = false;
+        alive = false;
+        main.removeCallbacks(ticker);
+        closeLink();
         stopAlarmSound();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        plcExec.shutdownNow();
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------ PLC 連携の準備
+    private void setupLink() {
+        plcCfg = store.loadPlc();
+        cfg = store.loadConfig();
+        if (!plcCfg.on) { plcStatus = ""; return; }
+        if (!plcCfg.server) { plcStatus = "PLC に接続しています…"; plcOk = false; plcFailSince = 0; return; }
+        if (server != null) return;
+        try {
+            server = new SlmpServer(plcCfg.port, (peer, cmd, sub, ok) -> {
+                lastReqAt = System.currentTimeMillis();
+                lastPeer = peer;
+                if (!ok) plcStatus = String.format(Locale.JAPAN, "PLC から未対応の要求（コマンド %04X / %04X）を受けました", cmd, sub);
+            });
+            server.start();
+            link = new PlcLink(server, plcCfg.head);
+            lastReqAt = 0;
+            serverReading = false;
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            wifiLock = wm.createWifiLock(Build.VERSION.SDK_INT >= 29 ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    : WifiManager.WIFI_MODE_FULL_HIGH_PERF, "bandsaw:plc");
+            wifiLock.acquire();
+            publishLink(null);
+            main.removeCallbacks(ticker);
+            main.post(ticker);
+        } catch (Exception e) {
+            server = null;
+            link = null;
+            plcStatus = "ポート " + plcCfg.port + " で待ち受けできません（" + e.getMessage() + "）";
+            store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, plcStatus);
+        }
+    }
+
+    private void closeLink() {
+        if (server != null) { server.close(); server = null; }
+        link = null;
+        if (slmp != null) { final Slmp s = slmp; plcExec.submit(s::close); slmp = null; }
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        wifiLock = null;
+        plcStatus = "";
+        plcOk = false;
+    }
+
+    // ------------------------------------------------------------ 監視（マイク）の開始・停止
+    /** @return PlcLink の結果コード */
+    private int startMic() {
+        if (running) return PlcLink.RES_OK;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            error = "マイクの許可がありません。";
+            return PlcLink.RES_MIC;
+        }
+        error = null;
+        cfg = store.loadConfig();
+        running = true;
+        stopFlag = false;
+        store.addEvent(System.currentTimeMillis(), "START", Double.NaN, "監視開始");
+        worker = new Thread(this::loop, "bandsaw-audio");
+        worker.start();
+        notifyUi();
+        return PlcLink.RES_OK;
+    }
+
+    private void stopMic() {
+        if (!running && worker == null) return;
+        stopFlag = true;
+        if (worker != null) {
+            try { worker.join(1500); } catch (InterruptedException ignored) { }
+            worker = null;
+        }
+        if (running) store.addEvent(System.currentTimeMillis(), "STOP", Double.NaN, "監視停止");
+        running = false;
+        state = "IDLE";
+        last = null;
+        acknowledge();
+        if (judge != null) store.saveBlade(judge.blade);
+        if (plcCfg != null && plcCfg.on && !plcCfg.server) sendPlc(null, true);   // 書込み方式: 「停止」を書いて終わる
+        if (link != null) {
+            publishLink(null);
+            getSystemService(NotificationManager.class).notify(ID_STATUS, statusNotification("待機中（PLC からの指令を待っています）"));
+        }
+        notifyUi();
     }
 
     private void startLearning() {
         long now = System.currentTimeMillis();
-        if (judge != null) {
+        if (judge != null && running) {
             synchronized (this) { judge.startLearning(now); store.saveBlade(judge.blade); }
         } else {
             Core.Blade b = new Core.Blade();
@@ -336,8 +324,6 @@ public class MonitorService extends Service {
         }
         store.addEvent(now, "LEARN", Double.NaN, "帯鋸交換。基準の学習を開始");
         acknowledge();
-        if (!running) stopSelf();
-        notifyUi();
     }
 
     private void acknowledge() {
@@ -345,6 +331,154 @@ public class MonitorService extends Service {
         alarming = false;
         getSystemService(NotificationManager.class).cancel(ID_ALARM);
         notifyUi();
+    }
+
+    // ------------------------------------------------------------ PLC からの指令
+    private void pollCommands() {
+        if (link == null) return;
+        Core.Config cur = cfg != null ? cfg : store.loadConfig();
+        link.poll(cur, new PlcLink.Actions() {
+            @Override public int start() {
+                store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC から「開始」");
+                return startMic();
+            }
+            @Override public int stop() {
+                store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC から「停止」");
+                stopMic();
+                return PlcLink.RES_OK;
+            }
+            @Override public int learn() {
+                store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC から「帯鋸交換」");
+                startLearning();
+                return PlcLink.RES_OK;
+            }
+            @Override public int ack() {
+                store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC から「警報確認」");
+                acknowledge();
+                return PlcLink.RES_OK;
+            }
+            @Override public int apply(Core.Config next) {
+                store.saveConfig(next);
+                cfg = next;
+                store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, String.format(Locale.JAPAN,
+                        "PLC から設定を反映（帯鋸 %.0fmm・ホイール %.0fmm・%.0f〜%.0frpm・注意 %.1f・警報 %.1f/%.1fdB・学習 %.0f分）",
+                        next.bladeMm, next.wheelMm, next.rpmMin, next.rpmMax, next.warnAvg, next.alarmAvg, next.alarmInst, next.learnMin));
+                if (running) { stopMic(); return startMic(); }    // 新しい設定で監視をやり直す
+                return PlcLink.RES_OK;
+            }
+        });
+        if (link != null && link.lastResult() >= 100 && link.accepted() != lastLoggedAccept) {
+            lastLoggedAccept = link.accepted();
+            store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC からの設定値が範囲外（結果コード " + link.lastResult() + "）。反映しませんでした");
+        }
+        notifyUi();
+    }
+    private int lastLoggedAccept = -1;
+
+    private int stateCode(Core.Result r) {
+        if (!running) return 0;
+        if (r == null || !r.ready || "IDLE".equals(r.state)) return 1;
+        if ("ALARM".equals(state)) return 5;
+        if ("WARN".equals(state)) return 4;
+        if (judge != null && judge.blade.learning) return 3;
+        return 2;
+    }
+
+    private static short x10(double v) {
+        if (Double.isNaN(v)) return 0;
+        return (short) Math.max(-32768, Math.min(32767, Math.round(v * 10)));
+    }
+
+    /** 待受方式: PLC が読む領域を更新し、読出し状況を表示用にまとめる */
+    private void publishLink(Core.Result r) {
+        PlcLink l = link;
+        if (l == null) return;
+        Core.Config c = cfg != null ? cfg : store.loadConfig();
+        l.publish(stateCode(r), heartbeat.incrementAndGet() & 0x7FFF,
+                x10(r == null ? Double.NaN : r.avg), x10(r == null ? Double.NaN : r.score),
+                alarming, (int) Math.round(learnProgress * 100), running, c);
+        long now = System.currentTimeMillis();
+        long age = now - lastReqAt;
+        if (lastReqAt == 0) {
+            plcOk = false;
+            String ip = wifiIp(this);
+            plcStatus = "PLC からの読出し待ち（このスマホ " + (ip == null ? "Wi-Fi 未接続" : ip) + " ポート " + plcCfg.port + "）";
+        } else if (age < 5000) {
+            plcOk = true;
+            plcStatus = String.format(Locale.JAPAN, "PLC と通信中（%s・%.1f秒前）D%d〜D%d", lastPeer, age / 1000.0, plcCfg.head, plcCfg.head + 39);
+            if (!serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC が読出しを始めました（" + lastPeer + "）");
+            serverReading = true;
+        } else {
+            plcOk = false;
+            plcStatus = String.format(Locale.JAPAN, "PLC からの読出しが %d 秒止まっています（最後: %s）", age / 1000, lastPeer);
+            if (serverReading) store.addEvent(now, "PLC", Double.NaN, "PLC からの読出しが途絶えました");
+            serverReading = false;
+        }
+    }
+
+    /** このスマホの Wi-Fi の IPv4 アドレス（PLC の交信先に登録する値） */
+    public static String wifiIp(Context ctx) {
+        try {
+            android.net.ConnectivityManager cm = ctx.getSystemService(android.net.ConnectivityManager.class);
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                if (nc == null || !nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue;
+                android.net.LinkProperties lp = cm.getLinkProperties(n);
+                if (lp == null) continue;
+                for (android.net.LinkAddress la : lp.getLinkAddresses())
+                    if (la.getAddress() instanceof java.net.Inet4Address)
+                        return la.getAddress().getHostAddress() + "/" + la.getPrefixLength();
+            }
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    // ------------------------------------------------------------ 書込み方式（アプリ → PLC）
+    private void bindToWifi() {
+        try {
+            android.net.ConnectivityManager cm = getSystemService(android.net.ConnectivityManager.class);
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                if (nc != null && nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                    cm.bindProcessToNetwork(n);
+                    return;
+                }
+            }
+            cm.bindProcessToNetwork(null);
+        } catch (Exception ignored) { }
+    }
+
+    /** D(n)=状態 / D(n+1)=生存カウンタ / D(n+2)=平均×10 / D(n+3)=瞬時×10 / D(n+4)=未確認の警報 */
+    private void sendPlc(Core.Result r, boolean stopping) {
+        if (plcCfg == null || !plcCfg.on || plcCfg.server) return;
+        if (!stopping && !plcBusy.compareAndSet(false, true)) return;
+        final short[] w = {(short) (stopping ? 0 : stateCode(r)), (short) (heartbeat.incrementAndGet() & 0x7FFF),
+                x10(r == null ? Double.NaN : r.avg), x10(r == null ? Double.NaN : r.score), (short) (alarming && !stopping ? 1 : 0)};
+        final Store.Plc pc = plcCfg;
+        Runnable job = () -> {
+            try {
+                if (slmp == null) { bindToWifi(); slmp = new Slmp(pc.host, pc.port, pc.udp); }
+                slmp.writeWords(pc.dev, pc.head, w);
+                if (!plcOk) store.addEvent(System.currentTimeMillis(), "PLC", Double.NaN, "PLC に接続しました（" + pc.host + " " + pc.headName() + "〜）");
+                plcOk = true;
+                plcFailSince = 0;
+                plcStatus = "PLC 送信中: " + pc.host + ":" + pc.port + (pc.udp ? " UDP " : " TCP ") + pc.headName() + "〜";
+            } catch (Exception e) {
+                long now = System.currentTimeMillis();
+                if (plcOk || plcFailSince == 0) {
+                    plcFailSince = now;
+                    store.addEvent(now, "PLC", Double.NaN, "PLC に送れません: " + e.getMessage());
+                }
+                plcOk = false;
+                plcStatus = "PLC に送れません（" + e.getMessage() + "）。再接続を続けます";
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) { }
+            } finally {
+                plcBusy.set(false);
+            }
+        };
+        if (stopping) {
+            try { plcExec.submit(job).get(3, TimeUnit.SECONDS); } catch (Exception ignored) { }
+        } else plcExec.submit(job);
     }
 
     // ------------------------------------------------------------ 音声ループ
@@ -381,33 +515,34 @@ public class MonitorService extends Service {
         AudioRecord rec = openRecorder(srBox);
         if (rec == null) {
             error = "マイクを開けませんでした。";
-            main.post(this::stopMonitoring);
+            running = false;
+            main.post(() -> { worker = null; if (link == null) quit(); else notifyUi(); });
             return;
         }
-        Core.Config cfg = store.loadConfig();
-        plcCfg = store.loadPlc();
-        slmp = null;
-        plcOk = false;
-        plcFailSince = 0;
-        plcStatus = plcCfg.on ? "PLC に接続しています…" : "";
-        lastReqAt = 0;
-        serverReading = false;
-        if (plcCfg.on && plcCfg.server) startServer();
-        Core.Detector det = new Core.Detector(cfg, srBox[0]);
-        synchronized (this) { judge = new Core.Judge(cfg, store.loadBlade()); }
+        Core.Config c = cfg != null ? cfg : store.loadConfig();
+        Core.Detector det = new Core.Detector(c, srBox[0]);
+        synchronized (this) { judge = new Core.Judge(c, store.loadBlade()); }
         float[] buf = new float[4096];
         ArrayList<Core.Result> out = new ArrayList<>();
         int saveCnt = 0;
-        rec.startRecording();
+        try {
+            rec.startRecording();
+        } catch (Exception e) {
+            error = "マイクを開始できませんでした（" + e.getMessage() + "）";
+            rec.release();
+            running = false;
+            main.post(() -> { worker = null; if (link == null) quit(); else notifyUi(); });
+            return;
+        }
         try {
             while (!stopFlag) {
                 int n = rec.read(buf, 0, buf.length, AudioRecord.READ_BLOCKING);
-                if (n <= 0) { if (n < 0) { error = "マイクの読み取りに失敗しました（" + n + "）"; } continue; }
+                if (n <= 0) { if (n < 0) error = "マイクの読み取りに失敗しました（" + n + "）"; continue; }
                 out.clear();
                 det.push(buf, n, out);
                 for (Core.Result r : out) {
                     long now = System.currentTimeMillis();
-                    java.util.List<String> evs;
+                    List<String> evs;
                     synchronized (this) {
                         evs = judge.update(r, now);
                         learnProgress = judge.learnProgress();
@@ -420,7 +555,7 @@ public class MonitorService extends Service {
                         while (!history.isEmpty() && history.peekFirst()[0] < now - 15 * 60 * 1000) history.removeFirst();
                     }
                     for (String e : evs) handleEvent(e, r, now);
-                    sendPlc(r, false);
+                    if (link != null) publishLink(r); else sendPlc(r, false);
                     if (!evs.isEmpty() || (judge.blade.learning && ++saveCnt % 120 == 0)) store.saveBlade(judge.blade);
                     if (now - lastStatusUpdate > 5000) {
                         lastStatusUpdate = now;
@@ -537,19 +672,13 @@ public class MonitorService extends Service {
         if (vibrator != null) vibrator.cancel();
     }
 
-    /** 設定画面の「警報をテストする」用 */
-    public static void testAlarm(Context ctx) {
-        Intent i = new Intent(ctx, MonitorService.class).setAction("jp.bandsaw.monitor.TEST");
-        ctx.startService(i);
-    }
-
-    // ------------------------------------------------------------ 通知（監視中）
+    // ------------------------------------------------------------ 通知（監視中・待機中）
     private Notification statusNotification(String text) {
         Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent p = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         return new Notification.Builder(this, CH_STATUS)
                 .setSmallIcon(R.drawable.ic_stat)
-                .setContentTitle("帯鋸打音モニター 監視中")
+                .setContentTitle(running ? "帯鋸打音モニター 監視中" : "帯鋸打音モニター 待機中")
                 .setContentText(text)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

@@ -44,7 +44,8 @@ public class MainActivity extends Activity {
     private TextView plcTv;
     private TextView stateTv, avgTv, msgTv, instTv, freqTv, lockTv, lvlTv, thTv, micTv, banner, baseTv, logTv, specTv;
     private ProgressBar prog;
-    private Button startBtn, ackBtn, batteryBtn;
+    private Button startBtn, ackBtn, batteryBtn, standbyBtn, quitBtn;
+    private String pendingAction = MonitorService.ACT_START;
     private ChartView chart;
     private final Handler h = new Handler(Looper.getMainLooper());
     private long lastLogRefresh = 0;
@@ -186,6 +187,15 @@ public class MainActivity extends Activity {
         row.addView(bladeBtn, p2);
         root.addView(row, lp(-1, -2, 0, 12));
 
+        standbyBtn = button("待機する（PLC からの指令を待つ・マイクは使わない）", Ui.PANEL2, Ui.ACCENT);
+        standbyBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        standbyBtn.setOnClickListener(v -> requestAndSend(MonitorService.ACT_STANDBY));
+        root.addView(standbyBtn, lp(-1, -2, 0, 10));
+        quitBtn = button("終了（PLC からの指令も受けない）", Ui.PANEL2, Ui.MUTED);
+        quitBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        quitBtn.setOnClickListener(v -> MonitorService.send(this, MonitorService.ACT_QUIT));
+        root.addView(quitBtn, lp(-1, -2, 0, 10));
+
         batteryBtn = button("電池の最適化を外す（監視が止まらないように）", Ui.PANEL2, Ui.WARN);
         batteryBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         batteryBtn.setOnClickListener(v -> {
@@ -283,6 +293,12 @@ public class MainActivity extends Activity {
             MonitorService.send(this, MonitorService.ACT_STOP);
             return;
         }
+        requestAndSend(MonitorService.ACT_START);
+    }
+
+    /** マイク・通知の許可を確かめてからサービスに指示する */
+    private void requestAndSend(String action) {
+        pendingAction = action;
         List<String> need = new ArrayList<>();
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
             need.add(Manifest.permission.RECORD_AUDIO);
@@ -293,7 +309,8 @@ public class MainActivity extends Activity {
             return;
         }
         MonitorService.error = null;
-        MonitorService.send(this, MonitorService.ACT_START);
+        banner.setVisibility(View.GONE);
+        MonitorService.send(this, action);
     }
 
     private void ensureNotifPermission() {
@@ -306,7 +323,7 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(code, perms, res);
         if (code != REQ_START) return;
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            MonitorService.send(this, MonitorService.ACT_START);
+            MonitorService.send(this, pendingAction);
         } else {
             showBanner("マイクが許可されていません。Android の設定 →「アプリ」→「帯鋸打音モニター」→「権限」でマイクを許可してください。");
         }
@@ -394,7 +411,8 @@ public class MainActivity extends Activity {
         head.setInputType(InputType.TYPE_CLASS_TEXT);
         head.setTextColor(Ui.FG); head.setTypeface(Typeface.MONOSPACE);
         l.addView(head);
-        l.addView(tv("+0 状態（0停止 1準備中 2平常 3学習中 4注意 5警報）\n+1 生存カウンタ（0.5秒ごとに+1）\n+2 30秒平均×10 ／ +3 瞬時×10\n+4 未確認の警報（1=鳴動中）", 12, Ui.MUTED, false), lp(-1, -2, 0, 4));
+        TextView mapTv = tv("", 12, Ui.MUTED, false);
+        l.addView(mapTv, lp(-1, -2, 0, 4));
         final boolean[] isServer = {pc.server};
         Runnable applyMode = () -> {
             boolean sv0 = isServer[0];
@@ -402,7 +420,10 @@ public class MainActivity extends Activity {
             ipLabel.setVisibility(vis); ip.setVisibility(vis); udp.setVisibility(vis); devLabel.setVisibility(vis); dev.setVisibility(vis);
             ipInfo.setVisibility(sv0 ? View.VISIBLE : View.GONE);
             portLabel.setText(sv0 ? "待ち受けるポート番号（TCP・UDP 両方。PLC の交信先ポートと同じ値）" : "PLC のポート番号（PLC のパラメータで開けたもの）");
-            headLabel.setText(sv0 ? "PLC が読む先頭デバイス（スマホ側の D 番号。ここから連続5語）" : "先頭番号（W は16進。ここから連続5語を書き込みます）");
+            headLabel.setText(sv0 ? "先頭デバイス（スマホ側の D 番号。ここから40語を使います）" : "先頭番号（W は16進。ここから連続5語を書き込みます）");
+            mapTv.setText(sv0
+                    ? "アプリ→PLC（読出し20点）\n+0 状態（0停止/待機 1準備中 2平常 3学習中 4注意 5警報）\n+1 生存カウンタ ／ +2 平均×10 ／ +3 瞬時×10 ／ +4 未確認の警報\n+5 指令の受付カウンタ ／ +6 結果（0=OK）／ +7 学習% ／ +8 監視中\n+10〜+19 今の設定値\nPLC→アプリ（書込み20点）\n+20 指令 .0開始 .1停止 .2帯鋸交換 .3警報確認 .4設定反映\n+21〜+30 新しい設定値"
+                    : "+0 状態（0停止 1準備中 2平常 3学習中 4注意 5警報）\n+1 生存カウンタ（0.5秒ごとに+1）\n+2 30秒平均×10 ／ +3 瞬時×10\n+4 未確認の警報（1=鳴動中）");
         };
         head.setText(!pc.server && "W".equalsIgnoreCase(pc.dev) ? Integer.toHexString(pc.head).toUpperCase() : String.valueOf(pc.head));
         applyMode.run();
@@ -440,9 +461,16 @@ public class MainActivity extends Activity {
                     try { np.head = Integer.parseInt(head.getText().toString().trim(), (!np.server && "W".equals(np.dev)) ? 16 : 10); } catch (NumberFormatException e) { np.head = pc.head; }
                     if (np.server) np.head = Math.max(0, Math.min(SlmpServer.MEM - 5, np.head));
                     store.savePlc(np);
-                    if (MonitorService.running) {
-                        MonitorService.send(this, MonitorService.ACT_STOP);
-                        h.postDelayed(() -> MonitorService.send(this, MonitorService.ACT_START), 1200);
+                    // 動いていれば新しい設定でやり直す（監視中なら監視、待機中なら待機に戻す）
+                    boolean wasRunning = MonitorService.running, wasAlive = MonitorService.alive;
+                    if (wasAlive) {
+                        MonitorService.send(this, MonitorService.ACT_QUIT);
+                        h.postDelayed(() -> {
+                            if (wasRunning) requestAndSend(MonitorService.ACT_START);
+                            else if (np.on && np.server) requestAndSend(MonitorService.ACT_STANDBY);
+                        }, 1500);
+                    } else if (np.on && np.server) {
+                        h.postDelayed(() -> requestAndSend(MonitorService.ACT_STANDBY), 300);
                     }
                     refresh();
                 })
@@ -496,7 +524,17 @@ public class MainActivity extends Activity {
         prog.setVisibility(learning ? View.VISIBLE : View.GONE);
         prog.setProgress((int) Math.round(MonitorService.learnProgress * 100));
 
-        if (!MonitorService.running) {
+        Store.Plc pcNow = store.loadPlc();
+        boolean serverMode = pcNow.on && pcNow.server;
+        standbyBtn.setVisibility(!MonitorService.alive && serverMode ? View.VISIBLE : View.GONE);
+        quitBtn.setVisibility(MonitorService.alive && !MonitorService.running ? View.VISIBLE : View.GONE);
+        if (!MonitorService.running && MonitorService.alive) {
+            setLamp("待機中", Ui.ACCENT, "PLC からの指令を待っています（マイクは止まっています）。「監視開始」か PLC の開始指令で監視を始めます。");
+            avgTv.setText("--.-");
+            micTv.setText("");
+            plcTv.setText(MonitorService.plcStatus);
+            plcTv.setTextColor(MonitorService.plcOk ? Ui.OK : Ui.WARN);
+        } else if (!MonitorService.running) {
             setLamp("停止中", Ui.MUTED, learning ? "「監視開始」を押すと、この帯鋸の基準を学習し始めます。" : "「監視開始」を押すと、マイクで帯鋸の音を聞き始めます。画面を消しても監視を続けます。");
             avgTv.setText("--.-");
             micTv.setText("");
@@ -504,7 +542,7 @@ public class MainActivity extends Activity {
             if (!pc.on) plcTv.setText("");
             else if (pc.server) {
                 String ip0 = MonitorService.wifiIp(this);
-                plcTv.setText("PLC: 監視開始で待ち受けます（このスマホ " + (ip0 == null ? "Wi-Fi 未接続" : ip0) + " ポート " + pc.port + "・D" + pc.head + "〜D" + (pc.head + 4) + "）");
+                plcTv.setText("PLC: 監視開始で待ち受けます（このスマホ " + (ip0 == null ? "Wi-Fi 未接続" : ip0) + " ポート " + pc.port + "・D" + pc.head + "〜D" + (pc.head + 39) + "）");
             } else plcTv.setText("PLC: 監視開始で " + pc.host + " の " + pc.headName() + "〜 に書き込みます");
             plcTv.setTextColor(Ui.MUTED);
         } else {

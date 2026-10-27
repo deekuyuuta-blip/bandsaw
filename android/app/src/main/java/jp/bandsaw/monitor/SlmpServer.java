@@ -33,6 +33,10 @@ public final class SlmpServer {
 
     private final int port;
     private final short[] mem = new short[MEM];
+    /** PLC からの書込み（1401）を受けた回数 */
+    private volatile int writes = 0;
+
+    public int writeCount() { return writes; }
     private final Listener listener;
     private volatile boolean stop;
     private DatagramSocket udp;
@@ -169,7 +173,11 @@ public final class SlmpServer {
         try {
             switch (cmd) {
                 case 0x0401: data = read(b, d, end, sub); if (data == null) err = 0xC059; break;
-                case 0x1401: err = write(b, d, end, sub) ? 0 : 0xC059; data = new byte[0]; break;
+                case 0x1401:
+                    err = write(b, d, end, sub) ? 0 : 0xC059;
+                    if (err == 0) writes++;
+                    data = new byte[0];
+                    break;
                 case 0x0619: {
                     int n = u16(b, d);
                     data = new byte[2 + n];
