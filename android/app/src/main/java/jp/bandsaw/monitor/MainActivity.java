@@ -47,6 +47,22 @@ public class MainActivity extends Activity {
     private Button startBtn, ackBtn, batteryBtn, standbyBtn, quitBtn;
     private String pendingAction = MonitorService.ACT_START;
     private ChartView chart;
+    // ---- グラフの期間と履歴
+    private static final long MIN = 60_000L, HOUR = 60 * MIN, DAY = 24 * HOUR;
+    private static final long[] RANGES = {15 * MIN, HOUR, 8 * HOUR, DAY, 7 * DAY};
+    private static final String[] RANGE_LABELS = {"15分", "1時間", "8時間", "1日", "7日"};
+    private int rangeIdx = 0;
+    /** 表示の右端の時刻。0 = 今（自動で進む） */
+    private long viewEnd = 0;
+    private Button[] rangeBtns;
+    private TextView rangeTv;
+    private Button nextBtn;
+    private final java.util.concurrent.ExecutorService io = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private List<double[]> histPts = new ArrayList<>();
+    private String histKey = "";
+    private long histAt = 0;
+    private boolean histLoading = false;
+    private List<Store.Event> evCache = new ArrayList<>();
     private final Handler h = new Handler(Looper.getMainLooper());
     private long lastLogRefresh = 0;
     private int lastEventCount = -1;
@@ -208,11 +224,67 @@ public class MainActivity extends Activity {
         root.addView(batteryBtn, lp(-1, -2, 0, 10));
 
         // グラフ
-        LinearLayout gcard = section(root, "推移（直近15分）");
+        LinearLayout gcard = section(root, "推移");
         baseTv = tv("", 12, Ui.MUTED, false);
         gcard.addView(baseTv);
+        LinearLayout rr = new LinearLayout(this);
+        rangeBtns = new Button[RANGES.length];
+        for (int i = 0; i < RANGES.length; i++) {
+            final int k = i;
+            Button b = button(RANGE_LABELS[i], Ui.PANEL2, Ui.FG);
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            b.setMinHeight(px(38));
+            b.setPadding(0, 0, 0, 0);
+            b.setOnClickListener(v -> { rangeIdx = k; if (viewEnd != 0) viewEnd = Math.max(viewEnd, System.currentTimeMillis() - 60 * DAY + RANGES[k]); histKey = ""; refresh(); });
+            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, px(40), 1);
+            if (i > 0) bp.leftMargin = px(4);
+            rr.addView(b, bp);
+            rangeBtns[i] = b;
+        }
+        gcard.addView(rr, lp(-1, -2, 0, 8));
         chart = new ChartView(this);
-        gcard.addView(chart, lp(-1, px(190), 0, 6));
+        gcard.addView(chart, lp(-1, px(210), 0, 6));
+        LinearLayout nav = new LinearLayout(this);
+        nav.setGravity(Gravity.CENTER_VERTICAL);
+        Button prevBtn = button("◀ 前へ", Ui.PANEL2, Ui.FG);
+        prevBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        prevBtn.setMinHeight(px(38));
+        prevBtn.setOnClickListener(v -> {
+            long end = viewEnd == 0 ? System.currentTimeMillis() : viewEnd;
+            viewEnd = Math.max(end - RANGES[rangeIdx], System.currentTimeMillis() - 60 * DAY + RANGES[rangeIdx]);
+            histKey = "";
+            refresh();
+        });
+        nextBtn = button("次へ ▶", Ui.PANEL2, Ui.FG);
+        nextBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        nextBtn.setMinHeight(px(38));
+        nextBtn.setOnClickListener(v -> {
+            if (viewEnd == 0) return;
+            viewEnd += RANGES[rangeIdx];
+            if (viewEnd >= System.currentTimeMillis() - 5000) viewEnd = 0;
+            histKey = "";
+            refresh();
+        });
+        Button nowBtn = button("今", Ui.PANEL2, Ui.FG);
+        nowBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        nowBtn.setMinHeight(px(38));
+        nowBtn.setOnClickListener(v -> { viewEnd = 0; histKey = ""; refresh(); });
+        nav.addView(prevBtn, new LinearLayout.LayoutParams(0, px(40), 1.2f));
+        LinearLayout.LayoutParams np1 = new LinearLayout.LayoutParams(0, px(40), 0.8f);
+        np1.leftMargin = px(6);
+        nav.addView(nowBtn, np1);
+        LinearLayout.LayoutParams np2 = new LinearLayout.LayoutParams(0, px(40), 1.2f);
+        np2.leftMargin = px(6);
+        nav.addView(nextBtn, np2);
+        gcard.addView(nav, lp(-1, -2, 0, 6));
+        rangeTv = tv("", 12, Ui.MUTED, false);
+        rangeTv.setTypeface(Typeface.MONOSPACE);
+        gcard.addView(rangeTv, lp(-1, -2, 0, 6));
+        Button csvBtn = button("表示中の期間を CSV で保存", Ui.PANEL2, Ui.ACCENT);
+        csvBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        csvBtn.setMinHeight(px(40));
+        csvBtn.setOnClickListener(v -> exportCsv());
+        gcard.addView(csvBtn, lp(-1, -2, 0, 8));
         SpannableStringBuilder lg = new SpannableStringBuilder();
         legend(lg, "━ 30秒平均  ", Ui.ACCENT);
         legend(lg, "━ 瞬時  ", 0xFF5E7A94);
@@ -564,15 +636,116 @@ public class MainActivity extends Activity {
                 lvlTv.setText(fmt(r.fullDb, 1));
             }
         }
-        List<double[]> pts;
-        synchronized (MonitorService.history) { pts = new ArrayList<>(MonitorService.history); }
-        chart.setData(pts, th);
+        updateChart(th);
 
         long now = System.currentTimeMillis();
         if (now - lastLogRefresh > 2000 || lastEventCount < 0) {
             lastLogRefresh = now;
             renderLog();
         }
+    }
+
+    // ------------------------------------------------------------ グラフ（期間・履歴・CSV）
+    private void updateChart(Core.Thresholds th) {
+        long now = System.currentTimeMillis();
+        long range = RANGES[rangeIdx];
+        long t1 = viewEnd == 0 ? now : viewEnd, t0 = t1 - range;
+        for (int i = 0; i < rangeBtns.length; i++) {
+            boolean sel = i == rangeIdx;
+            rangeBtns[i].setBackground(box(sel ? Ui.ACCENT : Ui.PANEL2, Ui.LINE, 8, sel ? 0 : 1));
+            rangeBtns[i].setTextColor(sel ? 0xFFFFFFFF : Ui.FG);
+        }
+        nextBtn.setEnabled(viewEnd != 0);
+        nextBtn.setAlpha(viewEnd != 0 ? 1f : 0.4f);
+        SimpleDateFormat f = new SimpleDateFormat(range >= DAY ? "MM/dd HH:mm" : "MM/dd HH:mm:ss", Locale.JAPAN);
+        rangeTv.setText(f.format(new Date(t0)) + " 〜 " + (viewEnd == 0 ? "今" : f.format(new Date(t1))));
+
+        List<double[]> pts;
+        if (rangeIdx == 0 && viewEnd == 0 && MonitorService.running) {
+            synchronized (MonitorService.history) { pts = new ArrayList<>(MonitorService.history); }   // 0.5秒ごとの細かい値
+        } else {
+            String key = rangeIdx + ":" + viewEnd;
+            if (!histLoading && (!key.equals(histKey) || (viewEnd == 0 && now - histAt > 10_000))) {
+                histLoading = true;
+                final long a = t0 - HistoryStore.BUCKET_MS, b = t1 + HistoryStore.BUCKET_MS;
+                final HistoryStore hs = MonitorService.history(this);
+                io.submit(() -> {
+                    hs.flush();
+                    List<double[]> l = hs.load(a, b);
+                    h.post(() -> { histPts = l; histKey = key; histAt = System.currentTimeMillis(); histLoading = false; refresh(); });
+                });
+            }
+            pts = histPts;
+        }
+        List<ChartView.Mark> marks = new ArrayList<>();
+        for (Store.Event e : evCache) {
+            if (e.t < t0 || e.t > t1) continue;
+            switch (e.type) {
+                case "ALARM": marks.add(new ChartView.Mark(e.t, Ui.ALARM, "警報")); break;
+                case "WARN": marks.add(new ChartView.Mark(e.t, Ui.WARN, "注意")); break;
+                case "BREAK": marks.add(new ChartView.Mark(e.t, Ui.ALARM, "破断音")); break;
+                case "LEARN": marks.add(new ChartView.Mark(e.t, Ui.LEARN, "交換")); break;
+            }
+        }
+        chart.setData(pts, th, t0, t1, marks, histLoading && pts.isEmpty() ? "読み込み中…" : "この期間の記録はありません");
+    }
+
+    private void exportCsv() {
+        long range = RANGES[rangeIdx];
+        long t1 = viewEnd == 0 ? System.currentTimeMillis() : viewEnd, t0 = t1 - range;
+        final HistoryStore hs = MonitorService.history(this);
+        final List<Store.Event> evs = store.events();
+        String name = "帯鋸_履歴_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.JAPAN).format(new Date(t0))
+                + "-" + new SimpleDateFormat("MMdd_HHmm", Locale.JAPAN).format(new Date(t1)) + ".csv";
+        io.submit(() -> {
+            String msg;
+            try {
+                hs.flush();
+                int[] rows = {0};
+                String where = saveToDownloads(name, os -> rows[0] = hs.writeCsv(os, t0, t1));
+                String evName = name.replace("履歴", "記録");
+                saveToDownloads(evName, os -> writeEvents(os, evs, t0, t1));
+                msg = rows[0] == 0 ? "この期間の記録はありませんでした（空のファイルを保存）" : rows[0] + " 行を保存しました: " + where;
+            } catch (Exception e) {
+                msg = "保存できませんでした（" + e.getMessage() + "）";
+            }
+            final String m = msg;
+            h.post(() -> android.widget.Toast.makeText(this, m, android.widget.Toast.LENGTH_LONG).show());
+        });
+    }
+
+    private interface CsvWriter { void write(java.io.OutputStream os) throws Exception; }
+
+    /** ダウンロード/帯鋸打音モニター に保存（Android 10 以上）。それより古い端末はアプリ専用フォルダ */
+    private String saveToDownloads(String name, CsvWriter w) throws Exception {
+        if (Build.VERSION.SDK_INT >= 29) {
+            android.content.ContentValues cv = new android.content.ContentValues();
+            cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+            cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/csv");
+            cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/帯鋸打音モニター");
+            Uri u = getContentResolver().insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (u == null) throw new java.io.IOException("ファイルを作れません");
+            try (java.io.OutputStream os = getContentResolver().openOutputStream(u)) { w.write(os); }
+            return "ダウンロード/帯鋸打音モニター/" + name;
+        } else {
+            java.io.File dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS);
+            java.io.File f = new java.io.File(dir, name);
+            try (java.io.OutputStream os = new java.io.FileOutputStream(f)) { w.write(os); }
+            return f.getAbsolutePath();
+        }
+    }
+
+    private static void writeEvents(java.io.OutputStream os, List<Store.Event> evs, long t0, long t1) throws Exception {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.JAPAN);
+        java.io.Writer w = new java.io.OutputStreamWriter(os, java.nio.charset.StandardCharsets.UTF_8);
+        w.write("\uFEFF日時,種類,スコアdB,内容\r\n");
+        for (int i = evs.size() - 1; i >= 0; i--) {
+            Store.Event e = evs.get(i);
+            if (e.t < t0 || e.t > t1) continue;
+            w.write(f.format(new Date(e.t)) + "," + label(e.type) + "," + (Double.isNaN(e.score) ? "" : String.format(Locale.ROOT, "%.1f", e.score))
+                    + ",\"" + e.text.replace("\"", "\"\"") + "\"\r\n");
+        }
+        w.flush();
     }
 
     private static String label(String t) {
@@ -595,6 +768,7 @@ public class MainActivity extends Activity {
 
     private void renderLog() {
         List<Store.Event> ev = store.events();
+        evCache = ev;
         lastEventCount = ev.size();
         if (ev.isEmpty()) { logTv.setText("まだ記録はありません。"); logTv.setTextColor(Ui.MUTED); return; }
         logTv.setTextColor(Ui.FG);

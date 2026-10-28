@@ -90,6 +90,14 @@ public class MonitorService extends Service {
     private long lastStatusUpdate = 0;
     private final AtomicInteger heartbeat = new AtomicInteger();
 
+    // ---- 履歴（グラフ用, 端末内に60日分）
+    private static HistoryStore hist;
+
+    public static synchronized HistoryStore history(Context ctx) {
+        if (hist == null) hist = new HistoryStore(new java.io.File(ctx.getApplicationContext().getFilesDir(), "history"), 60);
+        return hist;
+    }
+
     // PLC: 待受（シンプルCPU通信）
     private SlmpServer server;
     private PlcLink link;
@@ -201,6 +209,7 @@ public class MonitorService extends Service {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bandsaw:monitor");
         wakeLock.acquire();
+        history(this).prune(System.currentTimeMillis());
         return true;
     }
 
@@ -304,6 +313,7 @@ public class MonitorService extends Service {
         last = null;
         acknowledge();
         if (judge != null) store.saveBlade(judge.blade);
+        history(this).flush();
         if (plcCfg != null && plcCfg.on && !plcCfg.server) sendPlc(null, true);   // 書込み方式: 「停止」を書いて終わる
         if (link != null) {
             publishLink(null);
@@ -552,6 +562,7 @@ public class MonitorService extends Service {
                     last = r;
                     synchronized (history) {
                         history.addLast(new double[]{now, r.score, r.avg});
+                        if (r.ready) history(this).add(now, r.score, r.avg, stateCode(r));
                         while (!history.isEmpty() && history.peekFirst()[0] < now - 15 * 60 * 1000) history.removeFirst();
                     }
                     for (String e : evs) handleEvent(e, r, now);
