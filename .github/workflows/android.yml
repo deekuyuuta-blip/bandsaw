@@ -28,7 +28,14 @@ jobs:
 
       - name: APK をビルド
         working-directory: android
-        run: gradle assembleRelease --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! gradle assembleRelease --no-daemon 2>&1 | tee build.log; then
+            # コンパイルエラーを注釈として出す（ログを開かなくても見えるように）
+            grep -E "error:|e: |What went wrong" -A3 build.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: APK をまとめる
         run: cp android/app/build/outputs/apk/release/app-release.apk bandsaw.apk

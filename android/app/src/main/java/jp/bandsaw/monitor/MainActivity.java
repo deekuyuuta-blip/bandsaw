@@ -231,15 +231,15 @@ public class MainActivity extends Activity {
         rangeBtns = new Button[RANGES.length];
         for (int i = 0; i < RANGES.length; i++) {
             final int k = i;
-            Button b = button(RANGE_LABELS[i], Ui.PANEL2, Ui.FG);
-            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-            b.setMinHeight(px(38));
-            b.setPadding(0, 0, 0, 0);
-            b.setOnClickListener(v -> { rangeIdx = k; if (viewEnd != 0) viewEnd = Math.max(viewEnd, System.currentTimeMillis() - 60 * DAY + RANGES[k]); histKey = ""; refresh(); });
+            Button rb = button(RANGE_LABELS[i], Ui.PANEL2, Ui.FG);
+            rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            rb.setMinHeight(px(38));
+            rb.setPadding(0, 0, 0, 0);
+            rb.setOnClickListener(v -> { rangeIdx = k; if (viewEnd != 0) viewEnd = Math.max(viewEnd, System.currentTimeMillis() - 60 * DAY + RANGES[k]); histKey = ""; refresh(); });
             LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, px(40), 1);
             if (i > 0) bp.leftMargin = px(4);
-            rr.addView(b, bp);
-            rangeBtns[i] = b;
+            rr.addView(rb, bp);
+            rangeBtns[i] = rb;
         }
         gcard.addView(rr, lp(-1, -2, 0, 8));
         chart = new ChartView(this);
