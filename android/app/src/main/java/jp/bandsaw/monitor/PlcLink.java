@@ -59,8 +59,7 @@ public final class PlcLink {
 
     /** PLC からの設定値を検査して新しい Config を返す。範囲外なら code[0] に 101〜110 */
     public static Core.Config decode(short[] w, Core.Config cur, int[] code) {
-        Core.Config n = new Core.Config();
-        for (String k : Store.CFG_KEYS) Store.set(n, k, Store.get(cur, k));
+        Core.Config n = cur.copy();
         double[] v = new double[w.length];
         for (int i = 0; i < w.length; i++) {
             v[i] = w[i] / SCALE[i];

@@ -50,3 +50,15 @@
 ## PLC との連携（三菱・シンプルCPU通信）
 
 アプリが SLMP サーバーとして待ち受け、PLC がシンプルCPU通信で状態（5語）を読みに来ます。PLC 側でポートを開けたり外部からの書込みを許可したりする必要はありません。設定とラダー例は [docs/PLC接続.md](docs/PLC接続.md)。
+
+## PC 版（Windows）
+
+Android 版と同じ判定・PLC 連携（シンプルCPU通信／書込み）・グラフ履歴に加え、カメラ音声（RTSP）入力と録画ファイルの検証ができます。
+
+**ダウンロード:** https://github.com/deekuyuuta-blip/bandsaw/releases/download/pc/bandsaw-pc-win64.zip
+（展開して `BandsawMonitor.exe` を起動。Java 実行環境と ffmpeg 同梱）
+
+| パス | 内容 |
+|---|---|
+| `pc/src/` | PC 版のソース（Java / Swing）。判定・SLMP・履歴は `android/…/monitor/` の共通コードを使う |
+| `.github/workflows/pc.yml` | Windows 版を自動ビルドして `pc` リリースに置く |

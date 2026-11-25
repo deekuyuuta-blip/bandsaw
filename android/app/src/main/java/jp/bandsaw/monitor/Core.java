@@ -29,6 +29,16 @@ public final class Core {
         public double learnMin = 10, learnAlarmAvg = 16;
         public int clearHold = 240;
 
+        public Config copy() {
+            Config n = new Config();
+            n.bladeMm = bladeMm; n.wheelMm = wheelMm; n.rpmMin = rpmMin; n.rpmMax = rpmMax;
+            n.bandLo = bandLo; n.bandHi = bandHi; n.windowSec = windowSec; n.hopSec = hopSec; n.idleDb = idleDb;
+            n.avgSec = avgSec; n.lockRatio = lockRatio; n.warnAvg = warnAvg; n.alarmAvg = alarmAvg; n.alarmInst = alarmInst;
+            n.alarmHold = alarmHold; n.riseWarn = riseWarn; n.riseAlarm = riseAlarm; n.riseInst = riseInst;
+            n.learnMin = learnMin; n.learnAlarmAvg = learnAlarmAvg; n.clearHold = clearHold;
+            return n;
+        }
+
         public double[] bladeRange() {
             double circ = Math.PI * wheelMm / 1000.0, len = bladeMm / 1000.0;
             return new double[]{rpmMin / 60.0 * circ / len, rpmMax / 60.0 * circ / len};
